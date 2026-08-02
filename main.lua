@@ -31,7 +31,7 @@ local Geometry = require("lib/geometry")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local ReaderHighlight = require("apps/reader/modules/readerhighlight")
-local TouchMenu = require("ui/widget/touchmenu")
+local Menu = require("ui/widget/menu")
 local UIManager = require("ui/uimanager")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
@@ -45,16 +45,28 @@ local TOOL_TYPE_PEN = 1
 local TOOL_TYPE_HIGHLIGHTER = 3
 
 local HIT_TEST_THRESHOLD_PX = 25
-local REFRESH_INTERVAL_MS = 33
 local SAVE_DELAY_MS = 800
+
+-- Throttle for live drawing refreshes. Points are drawn into the shadow
+-- framebuffer immediately; the (region-based) e-ink update runs at most this
+-- often so the input loop stays responsive.
+local REFRESH_INTERVAL_MS = 60
+
+-- How long the pen must be held still (without drawing) before the pen-down is
+-- treated as a long-press: while drawing is enabled the stylus callback eats
+-- every event, so the gesture layer can never detect a hold on its own.
+local HOLD_TIME_S = 0.45
+-- Pen movement beyond this distance cancels the pending long-press (it is a
+-- drawing stroke after all).
+local HOLD_MOVE_THRESHOLD_PX = 15
 
 -- /Author ownership marker used to identify our /Ink annotations in the PDF,
 -- so we can delete & rewrite them without touching foreign annotations.
-local INK_MARKER = "stylus_annotations"
+local INK_MARKER = "stylus-annotations.koplugin"
 
 local DEFAULT_WIDTH = 3
 local DEFAULT_HIGHLIGHTER_WIDTH = 20
-local DEFAULT_COLOR = "yellow"
+local DEFAULT_COLOR = "gray"
 
 local WIDTH_CHOICES = { 2, 3, 5, 8, 12 }
 
@@ -101,9 +113,12 @@ local StylusAnnotations = InputContainer:extend{
     touch_zones_registered = false,
 
     current_stroke = nil,
-    current_stroke_zoom = 1,
     pen_x = 0,
     pen_y = 0,
+
+    hold_timer = nil,
+    hold_start_x = 0,
+    hold_start_y = 0,
 
     last_refresh_time = 0,
     refresh_interval_ms = REFRESH_INTERVAL_MS,
@@ -187,8 +202,11 @@ function StylusAnnotations:setupStylusCallback()
     end
     -- The stylus callback exists on the emulator too, but mouse/finger input
     -- doesn't produce pen events there, so also offer the touch-pan fallback
-    -- to keep drawing testable with a mouse.
-    if Device.isEmulator then
+    -- to keep drawing testable with a mouse. NOTE: isEmulator is a method
+    -- (generic/device.lua defines `no = function() return false end`), so it
+    -- must be called, not read as a boolean -- otherwise the fallback would
+    -- wrongly register on real hardware and clobber the pen gestures.
+    if Device:isEmulator() then
         self:setupTouchPenFallback()
     end
 end
@@ -330,18 +348,8 @@ function StylusAnnotations:getPageDimen(page)
     return dimen
 end
 
--- Reject points outside the native page bounds, so strokes can't be started
--- or continued over the footer/UI chrome (which would otherwise be stored as
--- off-page coordinates and mis-rendered later).
-function StylusAnnotations:isPointInPage(pos)
-    local dimen = self:getPageDimen(pos.page)
-    if not dimen then return true end -- can't determine bounds: don't block
-    return pos.x >= 0 and pos.y >= 0 and pos.x <= dimen.w and pos.y <= dimen.h
-end
-
 function StylusAnnotations:startStroke(x, y, tool)
     local pos = self.ui.view:screenToPageTransform({ x = x, y = y })
-    if not self:isPointInPage(pos) then return end
     self.stroke_id_counter = self.stroke_id_counter + 1
     self.current_stroke = {
         id = tostring(self.stroke_id_counter),
@@ -351,18 +359,34 @@ function StylusAnnotations:startStroke(x, y, tool)
         width = tool == TOOL_TYPE_HIGHLIGHTER and self.highlighter_width or self.width,
         color = self.color,
         alpha = tool == TOOL_TYPE_HIGHLIGHTER and 0.5 or 1.0,
+        zoom = pos.zoom or 1,
         datetime = os.time(),
     }
-    self.current_stroke_zoom = pos.zoom or 1
+    self.pen_x, self.pen_y = x, y
     self.last_refresh_time = time.now()
     self.dirty_region = nil
 
-    -- Draw the first point immediately (a dot).
+    -- Show the pen-down dot immediately (live feedback).
     local sw = self:getStrokeScreenWidth(self.current_stroke)
     local color = self:getRenderColor(self.current_stroke)
     local half = math.floor(sw / 2)
     Screen.bb:blendRectRGB32(x - half, y - half, sw, sw, color)
     self:accumulateDirty(x - half, y - half, sw, sw)
+    self:flushDirtyRegion()
+
+    -- While drawing is enabled the stylus callback dominates every event, so
+    -- the gesture layer can never see a long-press. Arm a hold check ourselves:
+    -- a pen held still (without drawing) opens the stroke menu instead.
+    self.hold_start_x, self.hold_start_y = x, y
+    if self.hold_timer then
+        UIManager:unschedule(self.hold_timer)
+    end
+    local hold_action = function()
+        self.hold_timer = nil
+        self:onStrokeHoldTimer()
+    end
+    self.hold_timer = hold_action
+    UIManager:scheduleIn(HOLD_TIME_S, hold_action)
 end
 
 function StylusAnnotations:addStrokePoint(x, y)
@@ -370,33 +394,46 @@ function StylusAnnotations:addStrokePoint(x, y)
     if not stroke then return end
     local pos = self.ui.view:screenToPageTransform({ x = x, y = y })
     if pos.page ~= stroke.page then return end -- should not happen mid-stroke
-    if not self:isPointInPage(pos) then return end
     local last = stroke.points[#stroke.points]
     if last and last.x == pos.x and last.y == pos.y then return end
     table.insert(stroke.points, { x = pos.x, y = pos.y })
 
-    -- Fast path: draw the new segment straight to the framebuffer, then
-    -- refresh the dirty region on a throttle. The view-module repaint that
-    -- follows stroke end redraws everything cleanly from stored coordinates.
+    -- Live drawing: draw the new segment straight into the shadow framebuffer
+    -- (cheap), then refresh the accumulated dirty region on a throttle. The
+    -- Android framebuffer does a full-window copy on each refresh, so the
+    -- throttle is what keeps the input loop responsive. The final repaint at
+    -- stroke end redraws everything cleanly from stored coordinates.
     local sw = self:getStrokeScreenWidth(stroke)
     local color = self:getRenderColor(stroke)
-    local x1, y1 = self.pen_x, self.pen_y
     local half = math.floor(sw / 2)
-    self:drawSegment(Screen.bb, x1, y1, x, y, sw, color)
-    self:accumulateDirty(math.min(x1, x) - half, math.min(y1, y) - half,
-        math.abs(x - x1) + sw, math.abs(y - y1) + sw)
+    self:drawSegment(Screen.bb, self.pen_x, self.pen_y, x, y, sw, color)
+    self:accumulateDirty(math.min(self.pen_x, x) - half, math.min(self.pen_y, y) - half,
+        math.abs(x - self.pen_x) + sw, math.abs(y - self.pen_y) + sw)
+    self.pen_x, self.pen_y = x, y
 
     local now = time.now()
     if time.to_ms(now - self.last_refresh_time) >= self.refresh_interval_ms then
         self.last_refresh_time = now
         self:flushDirtyRegion()
     end
+
+    -- Significant pen movement means drawing, not a long-press: cancel the
+    -- pending hold check.
+    if self.hold_timer
+        and (math.abs(x - self.hold_start_x) > HOLD_MOVE_THRESHOLD_PX
+            or math.abs(y - self.hold_start_y) > HOLD_MOVE_THRESHOLD_PX) then
+        UIManager:unschedule(self.hold_timer)
+        self.hold_timer = nil
+    end
 end
 
 function StylusAnnotations:endStroke()
+    if self.hold_timer then
+        UIManager:unschedule(self.hold_timer)
+        self.hold_timer = nil
+    end
     local stroke = self.current_stroke
     self.current_stroke = nil
-    self.current_stroke_zoom = 1
     self.dirty_region = nil
     if not stroke or #stroke.points == 0 then return end
 
@@ -409,13 +446,36 @@ function StylusAnnotations:endStroke()
     self:ensureBookmark(stroke.page)
     self:scheduleSave()
 
-    -- Full repaint: replaces the raw framebuffer drawing with the
-    -- view-module rendering of all strokes.
+    -- Repaint the view module's rendering of all strokes: a single clean
+    -- refresh replaces the live framebuffer drawing.
     UIManager:setDirty(self.view, "partial")
 end
 
+-- Pen-down without drawing for HOLD_TIME_S opens the stroke menu on the
+-- annotation under the pen (cancelling the stillborn dot stroke).
+function StylusAnnotations:onStrokeHoldTimer()
+    local stroke = self.current_stroke
+    if not stroke then return end
+    local dx = self.pen_x - self.hold_start_x
+    local dy = self.pen_y - self.hold_start_y
+    -- Pen actually moved: this is a (slow) stroke, not a long-press.
+    if math.sqrt(dx * dx + dy * dy) > HOLD_MOVE_THRESHOLD_PX then return end
+    -- Long-press: cancel the stillborn stroke, repaint to erase the live dot,
+    -- then open the stroke menu.
+    self.current_stroke = nil
+    self.dirty_region = nil
+    UIManager:setDirty(self.view, "partial")
+    self:showStrokeMenuAt(self.hold_start_x, self.hold_start_y)
+end
+
+function StylusAnnotations:showStrokeMenuAt(x, y)
+    local stroke = self:findStrokeAt({ pos = { x = x, y = y } })
+    if not stroke then return end
+    self:showStrokeMenu(stroke)
+end
+
 function StylusAnnotations:getStrokeScreenWidth(stroke)
-    return math.max(1, math.floor(stroke.width * self.current_stroke_zoom + 0.5))
+    return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
 end
 
 function StylusAnnotations:getRenderColor(stroke)
@@ -451,6 +511,8 @@ function StylusAnnotations:accumulateDirty(x, y, w, h)
     end
 end
 
+-- Live drawing refresh: a "partial" (non-flash, higher-quality) update of just
+-- the dirty region. We deliberately avoid the A2 "fast" mode here.
 function StylusAnnotations:flushDirtyRegion()
     local r = self.dirty_region
     if not r then return end
@@ -460,7 +522,11 @@ function StylusAnnotations:flushDirtyRegion()
     local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
     local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
     if rw > 0 and rh > 0 then
-        Screen:refreshUI(rx, ry, rw, rh)
+        -- A "partial" (non-flash, higher-quality) update rather than the A2
+        -- "fast" mode: A2 leaves the whole panel in a low-contrast residual
+        -- state, so repeated small fast updates during a stroke make stale
+        -- pages/UI show through ("ghost" in previous content).
+        Screen:refreshPartial(rx, ry, rw, rh)
     end
 end
 
@@ -689,7 +755,10 @@ function StylusAnnotations:showStrokeMenu(stroke)
         sub_item_table = width_items,
     }
 
-    UIManager:show(TouchMenu:new{ items = menu })
+    UIManager:show(Menu:new{
+        title = _("Stroke"),
+        item_table = menu,
+    })
 end
 
 function StylusAnnotations:setStrokeColor(stroke, color)
@@ -1059,6 +1128,10 @@ function StylusAnnotations:onCloseDocument()
     if self.pending_save then
         UIManager:unschedule(self.pending_save)
         self.pending_save = nil
+    end
+    if self.hold_timer then
+        UIManager:unschedule(self.hold_timer)
+        self.hold_timer = nil
     end
     self.current_stroke = nil
     self:teardownStylusCallback()
