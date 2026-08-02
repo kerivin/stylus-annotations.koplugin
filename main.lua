@@ -2,7 +2,9 @@
 Stylus annotations.
 
 Freehand pen & highlighter annotations for PDF documents, driven by the stylus
-callback API (Input:registerStylusCallback).
+callback API (Input:registerStylusCallback). On platforms without the stylus
+callback (e.g., the Linux emulator), a touch-pan fallback lets drawing be
+driven by finger/mouse drags while drawing is enabled.
 
 Strokes are stored in native page coordinates (top-left origin, y pointing
 down), which is exactly the space MuPDF's ink annotations expect: points
@@ -174,15 +176,21 @@ end
 function StylusAnnotations:setupStylusCallback()
     if self.stylus_callback_registered then return end
     local Input = Device.input
-    if not Input or not Input.registerStylusCallback then
+    if Input and Input.registerStylusCallback then
+        local plugin = self
+        Input:registerStylusCallback(function(input, slot)
+            return plugin:onStylusEvent(input, slot)
+        end)
+        self.stylus_callback_registered = true
+    else
         logger.warn("StylusAnnotations: stylus callback API not available")
-        return
     end
-    local plugin = self
-    Input:registerStylusCallback(function(input, slot)
-        return plugin:onStylusEvent(input, slot)
-    end)
-    self.stylus_callback_registered = true
+    -- The stylus callback exists on the emulator too, but mouse/finger input
+    -- doesn't produce pen events there, so also offer the touch-pan fallback
+    -- to keep drawing testable with a mouse.
+    if Device.isEmulator then
+        self:setupTouchPenFallback()
+    end
 end
 
 function StylusAnnotations:teardownStylusCallback()
@@ -192,6 +200,76 @@ function StylusAnnotations:teardownStylusCallback()
         Input:unregisterStylusCallback()
     end
     self.stylus_callback_registered = false
+end
+
+-- Fallback for platforms without the stylus callback API (e.g., the Linux
+-- emulator): route a single-finger drag as a pen stroke while drawing is
+-- enabled. Overrides the reader's pan handlers so we see the gesture first,
+-- then pass it through (return false) whenever we don't want to draw.
+function StylusAnnotations:setupTouchPenFallback()
+    if self.touch_pen_fallback_registered then return end
+    self.ui:registerTouchZones({
+        {
+            id = "stylus_annotations_pen_pan",
+            ges = "pan",
+            screen_zone = {
+                ratio_x = 0, ratio_y = 0,
+                ratio_w = 1, ratio_h = 1,
+            },
+            overrides = {
+                "rolling_pan",
+                "rolling_pan_release",
+                "paging_pan",
+                "paging_pan_release",
+            },
+            handler = function(ges)
+                return self:onPenPan(ges)
+            end,
+        },
+        {
+            id = "stylus_annotations_pen_pan_release",
+            ges = "pan_release",
+            screen_zone = {
+                ratio_x = 0, ratio_y = 0,
+                ratio_w = 1, ratio_h = 1,
+            },
+            overrides = {
+                "rolling_pan_release",
+                "paging_pan_release",
+            },
+            handler = function(ges)
+                return self:onPenPanRelease(ges)
+            end,
+        },
+    })
+    self.touch_pen_fallback_registered = true
+    logger.info("StylusAnnotations: touch-pan pen fallback registered")
+end
+
+function StylusAnnotations:onPenPan(ges)
+    if self:isOverlayActive() then return false end
+    if not self:isEnabled() then return false end
+    local start = ges.start_pos or ges.pos
+    local cur = ges.pos
+    if self.current_stroke then
+        self:addStrokePoint(cur.x, cur.y)
+    else
+        self:startStroke(start.x, start.y)
+        if self.current_stroke then
+            self:addStrokePoint(cur.x, cur.y)
+        end
+    end
+    self.pen_x, self.pen_y = cur.x, cur.y
+    return true
+end
+
+function StylusAnnotations:onPenPanRelease(ges)
+    if self:isOverlayActive() then return false end
+    if not self:isEnabled() then return false end
+    if self.current_stroke then
+        self:endStroke()
+    end
+    return true
 end
 
 -- Check if a menu or overlay is shown on top of the reader view.
@@ -245,7 +323,7 @@ function StylusAnnotations:getPageDimen(page)
     if dimen then return dimen end
     local doc = self.ui.document
     if not doc or not doc.getPageDimensions then return nil end
-    local rect = doc:getPageDimensions(page)
+    local rect = doc:getPageDimensions(page, 1, 0)
     if not rect or not rect.w or not rect.h then return nil end
     dimen = { w = rect.w, h = rect.h }
     self._page_dimen[page] = dimen
