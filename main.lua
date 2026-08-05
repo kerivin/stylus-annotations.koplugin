@@ -344,9 +344,13 @@ end
 function StylusAnnotations:isPenTap()
     local stroke = self.current_stroke
     if not stroke then return false end
-    if #stroke.points > 1 then return false end
     if not self.pen_down_time then return false end
-    return time.to_ms(time.now() - self.pen_down_time) < TAP_THRESHOLD_MS
+    if time.to_ms(time.now() - self.pen_down_time) >= TAP_THRESHOLD_MS then return false end
+    -- A short tap must not wander: reuse the long-press move threshold so a few
+    -- pixels of stylus jitter on the same spot still count as a tap.
+    local dx = self.pen_x - self.hold_start_x
+    local dy = self.pen_y - self.hold_start_y
+    return dx * dx + dy * dy <= HOLD_MOVE_THRESHOLD_PX * HOLD_MOVE_THRESHOLD_PX
 end
 
 function StylusAnnotations:clearHoldTimer()
@@ -775,6 +779,8 @@ function StylusAnnotations:setupTouchZones()
             },
             overrides = {
                 "readerfooter_holding",
+                "tap_forward",
+                "tap_backward",
             },
             handler = function(ges)
                 return self:onStrokeTap(ges)
@@ -907,9 +913,13 @@ end
 
 function StylusAnnotations:chooseStrokeWidth(stroke)
     local width_selector
+    local width_choices = {}
+    for _, w in ipairs(WIDTH_CHOICES) do
+        width_choices[#width_choices + 1] = { tostring(w), w }
+    end
     width_selector = ButtonSelector:new{
         current_value = stroke.width,
-        values = WIDTH_CHOICES,
+        values = width_choices,
         callback = function(value)
             self:setStrokeWidth(stroke, value)
             UIManager:close(width_selector)
