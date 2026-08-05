@@ -72,7 +72,7 @@ local INK_MARKER = "stylus-annotations.koplugin"
 
 local DEFAULT_WIDTH = 3
 local DEFAULT_HIGHLIGHTER_WIDTH = 20
-local DEFAULT_COLOR = "gray"
+local DEFAULT_COLOR = "orange"
 
 local WIDTH_CHOICES = { 2, 3, 5, 8, 12 }
 
@@ -184,6 +184,7 @@ end
 
 function StylusAnnotations:loadSettings()
     local ds = self.ui.doc_settings
+    self.live_ink = ds:readSetting("stylus_annotations_live_ink") == true
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
     self.highlighter_width = ds:readSetting("stylus_annotations_highlighter_width")
         or DEFAULT_HIGHLIGHTER_WIDTH
@@ -192,6 +193,7 @@ end
 
 function StylusAnnotations:saveSettings()
     local ds = self.ui.doc_settings
+    ds:saveSetting("stylus_annotations_live_ink", self.live_ink ~= false)
     ds:saveSetting("stylus_annotations_width", self.width)
     ds:saveSetting("stylus_annotations_highlighter_width", self.highlighter_width)
     ds:saveSetting("stylus_annotations_color", self.color)
@@ -416,6 +418,11 @@ function StylusAnnotations:startStroke(x, y, tool)
     self.pen_x, self.pen_y = x, y
     self.dirty_region = nil
 
+    -- Live-ink state: track where we last drew on the screen and the pending
+    -- fast-refresh region accumulating while the pen is down.
+    self.live_dirty = nil
+    self.live_last_x, self.live_last_y = x, y
+
     -- While drawing is enabled the stylus callback dominates every event, so
     -- the gesture layer can never see a long-press. Arm a hold check ourselves:
     -- a pen held still (without drawing) opens the stroke menu instead.
@@ -452,6 +459,31 @@ function StylusAnnotations:addStrokePoint(x, y)
     local seg_w = math.abs(x - self.pen_x) + sw
     local seg_h = math.abs(y - self.pen_y) + sw
     self:accumulateDirty(seg_x, seg_y, seg_w, seg_h)
+
+    -- Live ink: draw the new segment into the shadow immediately so the pen tip
+    -- is followed as it moves, then flush an immediate fast refresh to the
+    -- panel. The segment bounding box (seg_*) doubles as the pending refresh
+    -- region. endStroke() still redraws/refreshes nothing extra in this mode
+    -- beyond an idempotent fast+partial: it only schedules the crisp partial.
+    if self.live_ink ~= false then
+        local swz = self:getPageZoom(stroke.page) * stroke.width
+        self:drawStrokePath(Screen.bb,
+            { { x = self.live_last_x, y = self.live_last_y }, { x = x, y = y } },
+            swz, self:getRenderColor(stroke), stroke.alpha)
+        self.live_last_x, self.live_last_y = x, y
+        local ld = self.live_dirty
+        if ld then
+            local x0 = math.min(ld.x, seg_x)
+            local y0 = math.min(ld.y, seg_y)
+            local x1 = math.max(ld.x + ld.w, seg_x + seg_w)
+            local y1 = math.max(ld.y + ld.h, seg_y + seg_h)
+            self.live_dirty = { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
+        else
+            self.live_dirty = { x = seg_x, y = seg_y, w = seg_w, h = seg_h }
+        end
+        self:scheduleLiveRefresh()
+    end
+
     self.pen_x, self.pen_y = x, y
 
     -- Significant pen movement means drawing, not a long-press: cancel the
@@ -462,6 +494,33 @@ function StylusAnnotations:addStrokePoint(x, y)
         UIManager:unschedule(self.hold_timer)
         self.hold_timer = nil
     end
+end
+
+-- Live refresh: flush the pending segment to the panel immediately (no
+-- interval throttling). UIManager coalesces the actual repaints, so calling
+-- this on every pen point just requests the earliest possible fast refresh.
+function StylusAnnotations:scheduleLiveRefresh()
+    self:flushLive()
+end
+
+function StylusAnnotations:flushLive()
+    local ld = self.live_dirty
+    if not ld or ld.w <= 0 or ld.h <= 0 then return end
+    self.live_dirty = nil
+    local rx = math.max(0, math.floor(ld.x))
+    local ry = math.max(0, math.floor(ld.y))
+    local rw = math.min(Screen:getWidth() - rx, math.ceil(ld.w))
+    local rh = math.min(Screen:getHeight() - ry, math.ceil(ld.h))
+    if rw > 0 and rh > 0 then
+        UIManager:setDirty(self.view, function()
+            return "fast", Geom:new{x = rx, y = ry, w = rw, h = rh}
+        end)
+    end
+end
+
+-- Drop any pending live refresh state (called on pen-up).
+function StylusAnnotations:cancelLive()
+    self.live_dirty = nil
 end
 
 function StylusAnnotations:endStroke()
@@ -484,11 +543,17 @@ function StylusAnnotations:endStroke()
     self:ensureBookmark(stroke.page)
     self:scheduleSave()
 
-    -- Instant-ink: nothing was committed while the pen was down, so render the
-    -- finished stroke as a smooth spline into the shadow, then show it (fast),
-    -- and crisp it up shortly after.
-    self:renderStrokeToScreen(stroke)
-    self:refreshRegion(region)
+    -- Live ink already painted the buffer while the pen was down, so skip the
+    -- (re-blending) full render and just move on to the crisp refresh. In the
+    -- deferred mode nothing touched the panel yet, so render first, then do an
+    -- immediate partial so the stroke appears the moment the pen lifts.
+    self:cancelLive()
+    if self.live_ink == false then
+        self:renderStrokeToScreen(stroke)
+        self:refreshRegion(region, true)
+    else
+        self:refreshRegion(region, false)
+    end
 end
 
 function StylusAnnotations:renderStrokeToScreen(stroke)
@@ -506,7 +571,7 @@ function StylusAnnotations:renderStrokeToScreen(stroke)
     self:drawStrokePath(Screen.bb, sph, sw, color, stroke.alpha)
 end
 
-function StylusAnnotations:refreshRegion(region)
+function StylusAnnotations:refreshRegion(region, deferred)
     local function refresh(mode, r)
         if r then
             local rx = math.max(0, math.floor(r.x))
@@ -523,8 +588,15 @@ function StylusAnnotations:refreshRegion(region)
         UIManager:setDirty(self.view, mode)
     end
 
-    -- On pen-up show the finished line immediately with the low-latency fast
-    -- (A2) waveform so there is no lag after lifting the pen...
+    -- Deferred mode (live ink off): nothing touched the panel yet, so show the
+    -- finished stroke with an immediate partial update on pen-up.
+    if deferred then
+        refresh("partial", region)
+        return
+    end
+
+    -- Live mode: on pen-up show the finished line immediately with the
+    -- low-latency fast (A2) waveform so there is no lag after lifting the pen...
     refresh("fast", region)
     -- ...then crisp it up shortly after to clear the A2 residual. The cleanup
     -- is skipped if the user has already started a new stroke (whose own
@@ -840,6 +912,27 @@ function StylusAnnotations:chooseStrokeColor(stroke)
     UIManager:show(color_selector)
 end
 
+-- Default pen color picker, same ButtonSelector (color swatches) as the text
+-- highlights pop for "Color", so the two menus look identical.
+function StylusAnnotations:choosePenColor()
+    local color_selector
+    local bg_colors = {}
+    for i, c in ipairs(COLOR_PALETTE) do
+        bg_colors[i] = Blitbuffer.colorFromString(COLOR_HEX[c[2]] or "#808080")
+    end
+    color_selector = ButtonSelector:new{
+        current_value = self.color,
+        values = COLOR_PALETTE,
+        bg_colors = bg_colors,
+        callback = function(value)
+            self.color = value
+            self:saveSettings()
+            UIManager:close(color_selector)
+        end,
+    }
+    UIManager:show(color_selector)
+end
+
 function StylusAnnotations:chooseStrokeWidth(stroke)
     local width_selector
     width_selector = ButtonSelector:new{
@@ -1140,12 +1233,29 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Live ink refresh"),
+                checked_func = function()
+                    return self.live_ink ~= false
+                end,
+                callback = function()
+                    self.live_ink = not (self.live_ink ~= false)
+                    self:saveSettings()
+                    local state = self.live_ink and _("on") or _("off")
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Live ink refresh: %1"), state),
+                        timeout = 1,
+                    })
+                end,
+            },
+            {
                 text = _("Pen width"),
                 sub_item_table = self:getWidthMenuItems(),
             },
             {
                 text = _("Pen color"),
-                sub_item_table = self:getColorMenuItems(),
+                callback = function()
+                    self:choosePenColor()
+                end,
             },
             {
                 text = _("Delete all strokes"),
