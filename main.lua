@@ -515,6 +515,8 @@ function StylusAnnotations:endStroke()
     self.dirty_region = nil
     if not stroke or #stroke.points == 0 then return end
 
+    stroke.points = self:decimatePoints(stroke)
+
     table.insert(self.strokes, stroke)
     local idx = #self.strokes
     self.strokes_by_page[stroke.page] = self.strokes_by_page[stroke.page] or {}
@@ -534,6 +536,29 @@ function StylusAnnotations:endStroke()
     else
         self:refreshRegion(region, false)
     end
+end
+
+-- Reduce the number of stored points for a finished stroke. Points closer than
+-- MIN_SPACING screen pixels to the last kept point are dropped (measured in
+-- screen space via pageToScreenPoint so the threshold is resolution-independent).
+-- First and last points are always kept so the stroke endpoints stay exact.
+function StylusAnnotations:decimatePoints(stroke)
+    local pts = stroke.points
+    local n = #pts
+    if n <= 2 then return pts end
+    local MIN_SPACING = 2.5
+    local kept = { pts[1] }
+    local lx, ly = self:pageToScreenPoint(stroke.page, pts[1].x, pts[1].y)
+    for i = 2, n do
+        local p = pts[i]
+        local sx, sy = self:pageToScreenPoint(stroke.page, p.x, p.y)
+        local dx, dy = sx - lx, sy - ly
+        if math.sqrt(dx * dx + dy * dy) >= MIN_SPACING or i == n then
+            kept[#kept + 1] = p
+            lx, ly = sx, sy
+        end
+    end
+    return kept
 end
 
 function StylusAnnotations:renderStrokeToScreen(stroke)
@@ -724,6 +749,10 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
             for s = 1, steps do
                 stamp(x1 + dx * (s / steps), y1 + dy * (s / steps))
             end
+        else
+            -- Sub-pixel segment (slow movement): stamp the endpoint so the
+            -- stroke stays continuous; otherwise such points draw no ink at all.
+            stamp(x2, y2)
         end
         x1, y1 = x2, y2
     end
