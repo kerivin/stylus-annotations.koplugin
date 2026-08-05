@@ -37,7 +37,6 @@ local logger = require("logger")
 local dbg = require("dbg")
 local _ = require("gettext")
 local T = require("ffi/util").template
-local time = require("ui/time")
 
 local Screen = Device.screen
 
@@ -46,7 +45,6 @@ local TOOL_TYPE_HIGHLIGHTER = Device.input.TOOL_TYPE_HIGHLIGHTER
 
 local HIT_TEST_THRESHOLD_PX = 25
 local SAVE_DELAY_MS = 800
-local TAP_THRESHOLD_MS = 250
 local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
 
@@ -105,8 +103,6 @@ local StylusAnnotations = InputContainer:extend{
     hold_timer = nil,
     hold_start_x = 0,
     hold_start_y = 0,
-
-    pen_down_time = nil,
 
     dirty_region = nil,
 
@@ -314,26 +310,13 @@ function StylusAnnotations:onStylusEvent(input, slot)
         if self.current_stroke then
             self:addStrokePoint(x, y)
         else
-            self.pen_down_time = time.now()
             self:startStroke(x, y, tool)
         end
         self.pen_x, self.pen_y = x, y
     else
-        -- Contact lifted.
+        -- Contact lifted: end the stroke. A single point yields a small dot.
         if self.current_stroke then
-            -- A quick, movement-free down+up is a tap on the annotation below
-            -- (the pixel will draw on the first move), not a stroke.
-            if self:isPenTap() then
-                local tx, ty = self.pen_x, self.pen_y
-                self.current_stroke = nil
-                self.dirty_region = nil
-                self:clearHoldTimer()
-                self.pen_down_time = nil
-                UIManager:setDirty(self.view, "partial")
-                self:tryOpenStrokeMenuAt(tx, ty)
-            else
-                self:endStroke()
-            end
+            self:endStroke()
         end
     end
 
@@ -341,29 +324,10 @@ function StylusAnnotations:onStylusEvent(input, slot)
     return true
 end
 
-function StylusAnnotations:isPenTap()
-    local stroke = self.current_stroke
-    if not stroke then return false end
-    if not self.pen_down_time then return false end
-    if time.to_ms(time.now() - self.pen_down_time) >= TAP_THRESHOLD_MS then return false end
-    -- A short tap must not wander: reuse the long-press move threshold so a few
-    -- pixels of stylus jitter on the same spot still count as a tap.
-    local dx = self.pen_x - self.hold_start_x
-    local dy = self.pen_y - self.hold_start_y
-    return dx * dx + dy * dy <= HOLD_MOVE_THRESHOLD_PX * HOLD_MOVE_THRESHOLD_PX
-end
-
 function StylusAnnotations:clearHoldTimer()
     if self.hold_timer then
         UIManager:unschedule(self.hold_timer)
         self.hold_timer = nil
-    end
-end
-
-function StylusAnnotations:tryOpenStrokeMenuAt(x, y)
-    local stroke = self:findStrokeAt({ pos = { x = x, y = y } })
-    if stroke then
-        self:showStrokeMenu(stroke)
     end
 end
 
