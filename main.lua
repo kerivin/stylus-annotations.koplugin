@@ -41,8 +41,8 @@ local time = require("ui/time")
 
 local Screen = Device.screen
 
-local TOOL_TYPE_PEN = 1
-local TOOL_TYPE_HIGHLIGHTER = 3
+local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
+local TOOL_TYPE_HIGHLIGHTER = Device.input.TOOL_TYPE_HIGHLIGHTER
 
 local HIT_TEST_THRESHOLD_PX = 25
 local SAVE_DELAY_MS = 800
@@ -1136,23 +1136,6 @@ function StylusAnnotations:getWidthMenuItems()
             end,
             callback = function()
                 self.width = w
-                self:saveSettings()
-            end,
-        }
-    end
-    return items
-end
-
-function StylusAnnotations:getColorMenuItems()
-    local items = {}
-    for _, c in ipairs(COLOR_PALETTE) do
-        items[#items + 1] = {
-            text = c[1],
-            checked_func = function()
-                return self.color == c[2]
-            end,
-            callback = function()
-                self.color = c[2]
                 self:saveSettings()
             end,
         }
