@@ -553,7 +553,7 @@ function StylusAnnotations:decimatePoints(stroke)
         local p = pts[i]
         local sx, sy = self:pageToScreenPoint(stroke.page, p.x, p.y)
         local dx, dy = sx - lx, sy - ly
-        if math.sqrt(dx * dx + dy * dy) >= MIN_SPACING or i == n then
+        if dx * dx + dy * dy >= MIN_SPACING * MIN_SPACING or i == n then
             kept[#kept + 1] = p
             lx, ly = sx, sy
         end
@@ -620,7 +620,7 @@ function StylusAnnotations:onStrokeHoldTimer()
     local dx = self.pen_x - self.hold_start_x
     local dy = self.pen_y - self.hold_start_y
     -- Pen actually moved: this is a (slow) stroke, not a long-press.
-    if math.sqrt(dx * dx + dy * dy) > HOLD_MOVE_THRESHOLD_PX then return end
+    if dx * dx + dy * dy > HOLD_MOVE_THRESHOLD_PX * HOLD_MOVE_THRESHOLD_PX then return end
     -- Long-press: cancel the stillborn stroke, repaint to erase the live dot,
     -- then open the stroke menu.
     self.current_stroke = nil
@@ -743,9 +743,9 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
     for i = 2, n do
         local x2, y2 = sph[i].x, sph[i].y
         local dx, dy = x2 - x1, y2 - y1
-        local dist = math.sqrt(dx * dx + dy * dy)
-        if dist >= 1 then
-            local steps = math.ceil(dist)
+        local dist_sq = dx * dx + dy * dy
+        if dist_sq >= 1 then
+            local steps = math.ceil(math.sqrt(dist_sq))
             for s = 1, steps do
                 stamp(x1 + dx * (s / steps), y1 + dy * (s / steps))
             end
