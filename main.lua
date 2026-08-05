@@ -528,8 +528,7 @@ function StylusAnnotations:endStroke()
     -- Live ink already painted the buffer while the pen was down, so skip the
     -- (re-blending) full render and just move on to the crisp refresh. In the
     -- deferred mode nothing touched the panel yet, so render first, then do an
-    -- immediate fast (A2) refresh so the stroke appears the moment the pen lifts
-    -- (the crisp partial is scheduled right after by refreshRegion).
+    -- immediate partial so the stroke appears the moment the pen lifts.
     self:cancelLive()
     if self.live_ink == false then
         self:renderStrokeToScreen(stroke)
@@ -594,18 +593,10 @@ function StylusAnnotations:refreshRegion(region, deferred)
         UIManager:setDirty(self.view, mode)
     end
 
-    -- Deferred mode (live ink off): nothing touched the panel while the pen was
-    -- down, so render the finished stroke and reveal it immediately with the
-    -- low-latency fast (A2) waveform (dark/black pass), then crisp it up shortly
-    -- after with a partial (GU16) update to land on the final grey. This mirrors
-    -- live mode's fast-then-partial sequence, so a pen stroke looks the same in
-    -- both modes instead of flashing grey->black->grey.
+    -- Deferred mode (live ink off): nothing touched the panel yet, so show the
+    -- finished stroke with an immediate partial update on pen-up.
     if deferred then
-        refresh("fast", region)
-        UIManager:scheduleIn(REFINE_DELAY_MS / 1000, function()
-            if self.current_stroke then return end
-            refresh("partial", region)
-        end)
+        refresh("partial", region)
         return
     end
 
