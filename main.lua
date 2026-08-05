@@ -46,28 +46,17 @@ local TOOL_TYPE_HIGHLIGHTER = 3
 
 local HIT_TEST_THRESHOLD_PX = 25
 local SAVE_DELAY_MS = 800
--- Delay after pen-up before replacing the fast waveform's residual with a
--- crisp partial repaint of the finished stroke.
 local REFINE_DELAY_MS = 700
-
--- A pen down+up within this time and without drawing movement is treated as a
--- tap on the annotation under the pen (opens the stroke menu), instead of a
--- stillborn dot stroke. Must stay below HOLD_TIME_S.
 local TAP_THRESHOLD_MS = 250
-
--- How long the pen must be held still (without drawing) before the pen-down is
--- treated as a long-press: while drawing is enabled the stylus callback eats
--- every event, so the gesture layer can never detect a hold on its own.
 local HOLD_TIME_S = 0.45
--- Pen movement beyond this distance cancels the pending long-press (it is a
--- drawing stroke after all).
 local HOLD_MOVE_THRESHOLD_PX = 15
+local INK_MARKER = "stylus-annotations.koplugin"
 
-local DEFAULT_WIDTH = 3
+local DEFAULT_WIDTH = 2
 local DEFAULT_HIGHLIGHTER_WIDTH = 20
 local DEFAULT_COLOR = "orange"
 
-local WIDTH_CHOICES = { 2, 3, 5, 8, 12 }
+local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
 
 -- Colors offered only by this plugin, kept out of ReaderHighlight's
 -- text-highlight palette. Entries: { localized label, color name, "#RRGGBB" }.
