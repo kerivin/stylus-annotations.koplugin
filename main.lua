@@ -104,6 +104,8 @@ local StylusAnnotations = InputContainer:extend{
     hold_start_x = 0,
     hold_start_y = 0,
 
+    selected_stroke = nil,
+
     dirty_region = nil,
 
     pending_save = nil,
@@ -546,6 +548,7 @@ end
 -- Pen-down without drawing for HOLD_TIME_S opens the stroke menu on the
 -- annotation under the pen (cancelling the stillborn dot stroke).
 function StylusAnnotations:onStrokeHoldTimer()
+    self._last_by_finger = false
     local stroke = self.current_stroke
     if not stroke then return end
     local dx = self.pen_x - self.hold_start_x
@@ -619,6 +622,22 @@ function StylusAnnotations:paintTo(bb, x, y)
     if self.current_stroke then
         self:paintStroke(bb, x, y, self.current_stroke)
     end
+    -- Draw the selection last so a repaint (e.g. the finger-tap path) redraws
+    -- the box instead of wiping it. Screen.bb is a blitbuffer with :invertRect.
+    if self.selected_stroke then
+        logger.info("stylus-dbg paintTo draws selection", self.selected_stroke.id)
+        local x0, y0, x1, y1 = self:getStrokeScreenBox(self.selected_stroke)
+        if x0 then
+            local pad = math.max(4, math.floor(self.selected_stroke.width * (self.selected_stroke.zoom or 1)) + 2)
+            local rx = math.max(0, math.floor(x0 - pad))
+            local ry = math.max(0, math.floor(y0 - pad))
+            local rw = math.min(bb:getWidth() - rx, math.ceil((x1 - x0) + 2 * pad))
+            local rh = math.min(bb:getHeight() - ry, math.ceil((y1 - y0) + 2 * pad))
+            if rw > 0 and rh > 0 then
+                bb:invertRect(rx, ry, rw, rh)
+            end
+        end
+    end
 end
 
 function StylusAnnotations:getVisiblePages()
@@ -649,6 +668,22 @@ function StylusAnnotations:paintStroke(bb, x, y, stroke)
         sph[i] = { x = x + sx, y = y + sy }
     end
     self:drawStrokePath(bb, sph, sw, color, alpha)
+end
+
+function StylusAnnotations:getStrokeScreenBox(stroke)
+    local pts = stroke.points
+    local n = #pts
+    if n == 0 then return end
+    local x0, y0, x1, y1
+    for i = 1, n do
+        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i].x, pts[i].y)
+        if not sx then return end
+        if not x0 or sx < x0 then x0 = sx end
+        if not x1 or sx > x1 then x1 = sx end
+        if not y0 or sy < y0 then y0 = sy end
+        if not y1 or sy > y1 then y1 = sy end
+    end
+    return x0, y0, x1, y1
 end
 
 -- Render a stroke as a connected thick polyline: march an overlapping stamp along
@@ -769,6 +804,8 @@ function StylusAnnotations:onStrokeTap(ges)
     if self:isOverlayActive() then return false end
     local stroke = self:findStrokeAt(ges)
     if not stroke then return false end
+    self._last_by_finger = true
+    self:setSelection(stroke)
     self:showStrokeMenu(stroke)
     return true
 end
@@ -798,17 +835,74 @@ function StylusAnnotations:findStrokeAt(ges)
     return best
 end
 
+function StylusAnnotations:setSelection(stroke)
+    logger.info("stylus-dbg setSelection", stroke and stroke.id, "finger=", self._last_by_finger)
+    if self.selected_stroke == stroke then return end
+    self.selected_stroke = stroke
+    -- The stroke menu (modal dialog) is about to be shown and covers the view,
+    -- so the view-module paintTo won't run while it's up. Paint the selection
+    -- box straight into the framebuffer and refresh that region, like the
+    -- live-ink strokes do.
+    self:paintSelectionToScreen()
+end
+
+function StylusAnnotations:clearSelection()
+    if not self.selected_stroke then return end
+    logger.info("stylus-dbg clearSelection")
+    -- Restore the inverted pixels by inverting them back.
+    self:paintSelectionToScreen()
+    self.selected_stroke = nil
+end
+
+-- Invert the selected stroke's bounding box in the framebuffer and refresh that
+-- region. Inverting twice (set + clear) restores the original pixels.
+function StylusAnnotations:paintSelectionToScreen()
+    local stroke = self.selected_stroke
+    if not stroke then return end
+    local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
+    if not x0 then return end
+    local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
+    local rx = math.max(0, math.floor(x0 - pad))
+    local ry = math.max(0, math.floor(y0 - pad))
+    local rw = math.min(Screen:getWidth() - rx, math.ceil((x1 - x0) + 2 * pad))
+    local rh = math.min(Screen:getHeight() - ry, math.ceil((y1 - y0) + 2 * pad))
+    if rw <= 0 or rh <= 0 then return end
+    logger.info("stylus-dbg paintSelectionToScreen region", rx, ry, rw, rh)
+    Screen.bb:invertRect(rx, ry, rw, rh)
+    self:refreshRegion({ x = rx, y = ry, w = rw, h = rh })
+end
+
 function StylusAnnotations:showStrokeMenu(stroke)
+    -- Always show which stroke the menu applies to, whichever gesture opened it
+    -- (finger tap or stylus long-press).
+    self:setSelection(stroke)
     -- Same widget & layout as the text-highlight edit popup
     -- (ReaderHighlight:showHighlightDialog): a rounded ButtonDialog whose first
     -- row is the trash/deletion icon plus the per-item actions.
     local dialog
+    -- Anchor the popup to the stroke's screen box so it pops up or down next to
+    -- the stroke instead of covering it (mirroring ReaderHighlight's anchored
+    -- highlight dialog). Falls back to the default centered position if the
+    -- stroke isn't currently on screen.
     dialog = ButtonDialog:new{
+        anchor = function()
+            local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
+            if not x0 then return end
+            -- pageToScreenPoint returns coords relative to the view widget, which
+            -- sits at the top-left of the screen here; pad the box so the popup
+            -- gets a little clearance from the ink.
+            local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
+            return { x = x0 - pad, y = y0 - pad, w = (x1 - x0) + 2 * pad, h = (y1 - y0) + 2 * pad }
+        end,
+        tap_close_callback = function()
+            self:clearSelection()
+        end,
         buttons = {
             {
                 {
                     text = "\u{F48E}", -- Trash can (same icon as highlight delete)
                     callback = function()
+                        self:clearSelection()
                         UIManager:close(dialog)
                         self:deleteStroke(stroke)
                     end,
@@ -816,6 +910,7 @@ function StylusAnnotations:showStrokeMenu(stroke)
                 {
                     text = _("Color"),
                     callback = function()
+                        self:clearSelection()
                         UIManager:close(dialog)
                         self:chooseStrokeColor(stroke)
                     end,
@@ -823,6 +918,7 @@ function StylusAnnotations:showStrokeMenu(stroke)
                 {
                     text = _("Width"),
                     callback = function()
+                        self:clearSelection()
                         UIManager:close(dialog)
                         self:chooseStrokeWidth(stroke)
                     end,
@@ -908,6 +1004,9 @@ function StylusAnnotations:afterStrokeModified(stroke)
 end
 
 function StylusAnnotations:deleteStroke(stroke)
+    if self.selected_stroke == stroke then
+        self.selected_stroke = nil
+    end
     local page = stroke.page
     for i, s in ipairs(self.strokes) do
         if s == stroke then
