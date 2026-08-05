@@ -7,15 +7,12 @@ callback (e.g., the Linux emulator), a touch-pan fallback lets drawing be
 driven by finger/mouse drags while drawing is enabled.
 
 Strokes are stored in native page coordinates (top-left origin, y pointing
-down), which is exactly the space MuPDF's ink annotations expect: points
-captured with ReaderView:screenToPageTransform are stored verbatim (no y-flip,
-no rotation handling: KOReader rotates the framebuffer, not the document).
+down): points captured with ReaderView:screenToPageTransform are stored
+verbatim (no y-flip, no rotation handling: KOReader rotates the framebuffer,
+not the document).
 
-Persistence is dual: strokes are written to a sidecar
-(<sidecar_dir>/stylus_annotations.lua), and simultaneously mirrored as
-native PDF /Ink annotations (tagged with an /Author ownership marker) so
-they show up in any PDF viewer and survive the sidecar. The PDF file itself
-is written out when the document closes.
+Strokes are persisted to a document sidecar
+(<sidecar_dir>/stylus_annotations.lua), as the only storage.
 
 Only the PDF format is supported for now.
 
@@ -65,10 +62,6 @@ local HOLD_TIME_S = 0.45
 -- Pen movement beyond this distance cancels the pending long-press (it is a
 -- drawing stroke after all).
 local HOLD_MOVE_THRESHOLD_PX = 15
-
--- /Author ownership marker used to identify our /Ink annotations in the PDF,
--- so we can delete & rewrite them without touching foreign annotations.
-local INK_MARKER = "stylus-annotations.koplugin"
 
 local DEFAULT_WIDTH = 3
 local DEFAULT_HIGHLIGHTER_WIDTH = 20
@@ -138,7 +131,6 @@ function StylusAnnotations:init()
     self.strokes_by_page = {}
     self.bookmarked_pages = {}
     self._page_dimen = {}
-    self._pdf_dirty_pages = {}
     self.stroke_id_counter = 0
 
     self:loadSettings()
@@ -539,7 +531,6 @@ function StylusAnnotations:endStroke()
     self.strokes_by_page[stroke.page] = self.strokes_by_page[stroke.page] or {}
     table.insert(self.strokes_by_page[stroke.page], idx)
 
-    self:markPdfDirty(stroke.page)
     self:ensureBookmark(stroke.page)
     self:scheduleSave()
 
@@ -957,7 +948,6 @@ function StylusAnnotations:setStrokeWidth(stroke, width)
 end
 
 function StylusAnnotations:afterStrokeModified(stroke)
-    self:markPdfDirty(stroke.page)
     self:scheduleSave()
     UIManager:setDirty(self.view, "partial")
 end
@@ -971,7 +961,6 @@ function StylusAnnotations:deleteStroke(stroke)
         end
     end
     self:rebuildPageIndex()
-    self:markPdfDirty(page)
     self:maybeRemoveBookmark(page)
     self:scheduleSave()
     UIManager:setDirty(self.view, "partial")
@@ -1060,15 +1049,6 @@ function StylusAnnotations:saveStrokes()
     else
         logger.err("StylusAnnotations: failed to write strokes:", err)
     end
-
-    -- Mirror the strokes as native PDF /Ink annotations (in-memory only,
-    -- the file itself is written out at document close).
-    local ok, sync_err = pcall(function()
-        self:syncStrokesToPdf()
-    end)
-    if not ok then
-        logger.warn("StylusAnnotations: PDF ink sync failed:", sync_err)
-    end
 end
 
 function StylusAnnotations:loadStrokes()
@@ -1079,16 +1059,7 @@ function StylusAnnotations:loadStrokes()
     self.strokes_loaded = true
     if not filepath then return end
     local f = io.open(filepath, "r")
-    if not f then
-        -- No sidecar yet: fall back to whatever the PDF itself holds.
-        local ok, err = pcall(function()
-            self:importInkFromPdf()
-        end)
-        if not ok then
-            logger.warn("StylusAnnotations: PDF ink import failed:", err)
-        end
-        return
-    end
+    if not f then return end
     f:close()
     local ok, data = pcall(dofile, filepath)
     if ok and data and data.strokes then
@@ -1096,107 +1067,6 @@ function StylusAnnotations:loadStrokes()
         self:rebuildPageIndex()
         logger.info("StylusAnnotations: loaded", #self.strokes, "strokes from", filepath)
     end
-end
-
---------------------------------------------------------------------------------
--- Native PDF ink annotations
---------------------------------------------------------------------------------
-
--- Track the pages whose /Ink mirror is out of date (added/moved/edited/deleted
--- strokes), so we always rewrite the exact set of pages we touched.
-function StylusAnnotations:markPdfDirty(page)
-    if not page then return end
-    self._pdf_dirty_pages[page] = true
-end
-
-function StylusAnnotations:getPageStrokes(page)
-    local strokes = {}
-    for _, idx in ipairs(self.strokes_by_page[page] or {}) do
-        strokes[#strokes + 1] = self.strokes[idx]
-    end
-    return strokes
-end
-
--- Stroke color name -> { r, g, b } in 0-255 for the PDF.
-function StylusAnnotations:getPdfColor(stroke)
-    local hex = COLOR_HEX[stroke.color]
-    if not hex then return { r = 255, g = 255, b = 0 } end
-    local r, g, b = hex:match("#(..)(..)(..)")
-    return { r = tonumber(r, 16), g = tonumber(g, 16), b = tonumber(b, 16) }
-end
-
--- PDF { r, g, b } in 0-1 -> nearest palette color name.
-function StylusAnnotations:nameFromPdfColor(color)
-    if not color then return DEFAULT_COLOR end
-    local best_name, best_dist = DEFAULT_COLOR
-    for name, hex in pairs(COLOR_HEX) do
-        local r, g, b = hex:match("#(..)(..)(..)")
-        local d = (color[1]*255 - tonumber(r, 16))^2
-            + (color[2]*255 - tonumber(g, 16))^2
-            + (color[3]*255 - tonumber(b, 16))^2
-        if not best_dist or d < best_dist then
-            best_name, best_dist = name, d
-        end
-    end
-    return best_name
-end
-
--- Rewrite our /Ink annotations on every dirty page to match the current strokes.
--- Delete-then-rewrite keeps things idempotent; foreign ink (no /Author marker) is left alone.
--- This only mutates the in-memory PDF; the file is written out at document close.
-function StylusAnnotations:syncStrokesToPdf()
-    if not self._pdf_dirty_pages or next(self._pdf_dirty_pages) == nil then return end
-    local doc = self.ui.document
-    if not doc or not doc.saveInkAnnotation or not doc.deleteInkAnnotations then
-        self._pdf_dirty_pages = {}
-        return
-    end
-    for page, _ in pairs(self._pdf_dirty_pages) do
-        doc:deleteInkAnnotations(page, INK_MARKER)
-        for _, idx in ipairs(self.strokes_by_page[page] or {}) do
-            local stroke = self.strokes[idx]
-            doc:saveInkAnnotation(page, stroke.points, self:getPdfColor(stroke),
-                stroke.width, stroke.alpha, INK_MARKER)
-        end
-    end
-    self._pdf_dirty_pages = {}
-end
-
--- Load strokes from the PDF's own /Ink annotations (fallback when no sidecar
--- exists, e.g., the PDF was annotated elsewhere and transferred).
-function StylusAnnotations:importInkFromPdf()
-    local doc = self.ui.document
-    if not doc or not doc.getInkAnnotations then return 0 end
-    local imported = 0
-    for page = 1, doc.info.number_of_pages do
-        local annots = doc:getInkAnnotations(page)
-        for _, data in ipairs(annots) do
-            if data.author == INK_MARKER and data.strokes then
-                for _, pts in ipairs(data.strokes) do
-                    if #pts >= 1 then
-                        self.stroke_id_counter = self.stroke_id_counter + 1
-                        local is_highlighter = (data.opacity or 1.0) < 1.0
-                        table.insert(self.strokes, {
-                            id = tostring(self.stroke_id_counter),
-                            page = page,
-                            tool = is_highlighter and "highlighter" or "pen",
-                            points = pts,
-                            width = data.width or DEFAULT_WIDTH,
-                            color = self:nameFromPdfColor(data.color),
-                            alpha = data.opacity or 1.0,
-                            datetime = os.time(),
-                        })
-                        imported = imported + 1
-                    end
-                end
-            end
-        end
-    end
-    if imported > 0 then
-        self:rebuildPageIndex()
-        logger.info("StylusAnnotations: imported", imported, "strokes from the PDF")
-    end
-    return imported
 end
 
 --------------------------------------------------------------------------------
@@ -1313,7 +1183,6 @@ function StylusAnnotations:deleteAllStrokes()
             self.strokes = {}
             self:rebuildPageIndex()
             for _, page in ipairs(pages) do
-                self:markPdfDirty(page)
                 self:maybeRemoveBookmark(page)
             end
             self:scheduleSave()
@@ -1338,19 +1207,6 @@ function StylusAnnotations:onCloseDocument()
     self.current_stroke = nil
     self:teardownStylusCallback()
     self:saveStrokes()
-    -- Persist the native PDF /Ink mirror now: KOReader's close path would
-    -- discard it (discardChange) unless "Write highlights into PDF" is enabled,
-    -- so we own the write ourselves, and clear is_edited to avoid a double write.
-    local doc = self.ui.document
-    if doc and doc.isEdited and doc:isEdited() and doc.writeDocument then
-        local ok, err = pcall(function()
-            doc:writeDocument()
-            doc.is_edited = false
-        end)
-        if not ok then
-            logger.warn("StylusAnnotations: failed to write PDF:", err)
-        end
-    end
 end
 
 return StylusAnnotations
