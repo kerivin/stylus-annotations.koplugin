@@ -548,7 +548,6 @@ end
 -- Pen-down without drawing for HOLD_TIME_S opens the stroke menu on the
 -- annotation under the pen (cancelling the stillborn dot stroke).
 function StylusAnnotations:onStrokeHoldTimer()
-    self._last_by_finger = false
     local stroke = self.current_stroke
     if not stroke then return end
     local dx = self.pen_x - self.hold_start_x
@@ -625,7 +624,6 @@ function StylusAnnotations:paintTo(bb, x, y)
     -- Draw the selection last so a repaint (e.g. the finger-tap path) redraws
     -- the box instead of wiping it. Screen.bb is a blitbuffer with :invertRect.
     if self.selected_stroke then
-        logger.info("stylus-dbg paintTo draws selection", self.selected_stroke.id)
         local x0, y0, x1, y1 = self:getStrokeScreenBox(self.selected_stroke)
         if x0 then
             local pad = math.max(4, math.floor(self.selected_stroke.width * (self.selected_stroke.zoom or 1)) + 2)
@@ -813,7 +811,6 @@ function StylusAnnotations:onStrokeTap(ges)
     if self:isOverlayActive() then return false end
     local stroke = self:findStrokeAt(ges)
     if not stroke then return false end
-    self._last_by_finger = true
     self:setSelection(stroke)
     self:showStrokeMenu(stroke)
     return true
@@ -845,7 +842,6 @@ function StylusAnnotations:findStrokeAt(ges)
 end
 
 function StylusAnnotations:setSelection(stroke)
-    logger.info("stylus-dbg setSelection", stroke and stroke.id, "finger=", self._last_by_finger)
     if self.selected_stroke == stroke then return end
     self.selected_stroke = stroke
     -- The stroke menu (modal dialog) is about to be shown and covers the view,
@@ -857,7 +853,6 @@ end
 
 function StylusAnnotations:clearSelection()
     if not self.selected_stroke then return end
-    logger.info("stylus-dbg clearSelection")
     -- Restore the inverted pixels by inverting them back.
     self:paintSelectionToScreen()
     self.selected_stroke = nil
@@ -876,7 +871,6 @@ function StylusAnnotations:paintSelectionToScreen()
     local rw = math.min(Screen:getWidth() - rx, math.ceil((x1 - x0) + 2 * pad))
     local rh = math.min(Screen:getHeight() - ry, math.ceil((y1 - y0) + 2 * pad))
     if rw <= 0 or rh <= 0 then return end
-    logger.info("stylus-dbg paintSelectionToScreen region", rx, ry, rw, rh)
     Screen.bb:invertRect(rx, ry, rw, rh)
     self:refreshRegion({ x = rx, y = ry, w = rw, h = rh })
 end
