@@ -778,8 +778,17 @@ function StylusAnnotations:setupTouchZones()
             },
             overrides = {
                 "readerfooter_holding",
+                "readerfooter_tap",
+                "readerconfigmenu_tap",
+                "readerconfigmenu_ext_tap",
                 "tap_forward",
                 "tap_backward",
+                "readermenu_tap",
+                "readermenu_ext_tap",
+                "tap_top_left_corner",
+                "tap_top_right_corner",
+                "tap_left_bottom_corner",
+                "tap_right_bottom_corner",
             },
             handler = function(ges)
                 return self:onStrokeTap(ges)
