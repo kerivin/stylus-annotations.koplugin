@@ -885,6 +885,7 @@ function StylusAnnotations:showStrokeMenu(stroke)
     -- highlight dialog). Falls back to the default centered position if the
     -- stroke isn't currently on screen.
     dialog = ButtonDialog:new{
+        width_factor = 0.45,
         anchor = function()
             local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
             if not x0 then return end
