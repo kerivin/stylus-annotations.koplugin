@@ -49,7 +49,6 @@ local SAVE_DELAY_MS = 800
 local TAP_THRESHOLD_MS = 250
 local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
-local INK_MARKER = "stylus-annotations.koplugin"
 
 local DEFAULT_WIDTH = 2
 local DEFAULT_HIGHLIGHTER_WIDTH = 20
@@ -118,7 +117,6 @@ function StylusAnnotations:init()
     self.strokes = {}
     self.strokes_by_page = {}
     self.bookmarked_pages = {}
-    self._page_dimen = {}
     self.stroke_id_counter = 0
 
     self:loadSettings()
@@ -369,18 +367,6 @@ end
 -- Live drawing
 --------------------------------------------------------------------------------
 
-function StylusAnnotations:getPageDimen(page)
-    local dimen = self._page_dimen[page]
-    if dimen then return dimen end
-    local doc = self.ui.document
-    if not doc or not doc.getPageDimensions then return nil end
-    local rect = doc:getPageDimensions(page, 1, 0)
-    if not rect or not rect.w or not rect.h then return nil end
-    dimen = { w = rect.w, h = rect.h }
-    self._page_dimen[page] = dimen
-    return dimen
-end
-
 function StylusAnnotations:startStroke(x, y, tool)
     local pos = self.ui.view:screenToPageTransform({ x = x, y = y })
     self.stroke_id_counter = self.stroke_id_counter + 1
@@ -461,7 +447,7 @@ function StylusAnnotations:addStrokePoint(x, y)
         else
             self.live_dirty = { x = seg_x, y = seg_y, w = seg_w, h = seg_h }
         end
-        self:scheduleLiveRefresh()
+        self:flushLive()
     end
 
     self.pen_x, self.pen_y = x, y
@@ -474,13 +460,6 @@ function StylusAnnotations:addStrokePoint(x, y)
         UIManager:unschedule(self.hold_timer)
         self.hold_timer = nil
     end
-end
-
--- Live refresh: flush the pending segment to the panel immediately (no
--- interval throttling). UIManager coalesces the actual repaints, so calling
--- this on every pen point just requests the earliest possible fast refresh.
-function StylusAnnotations:scheduleLiveRefresh()
-    self:flushLive()
 end
 
 function StylusAnnotations:flushLive()
@@ -524,17 +503,14 @@ function StylusAnnotations:endStroke()
     self:ensureBookmark(stroke.page)
     self:scheduleSave()
 
-    -- Live ink already painted the buffer while the pen was down, so skip the
-    -- (re-blending) full render and just move on to the crisp refresh. In the
-    -- deferred mode nothing touched the panel yet, so render first, then do an
-    -- immediate partial so the stroke appears the moment the pen lifts.
     self:cancelLive()
+    -- Live ink already painted the buffer while the pen was down, so skip the
+    -- (re-blending) full render. In the deferred mode nothing touched the panel
+    -- yet, so render first, then do the crisp partial on pen-up either way.
     if self.live_ink == false then
         self:renderStrokeToScreen(stroke)
-        self:refreshRegion(region, true)
-    else
-        self:refreshRegion(region, false)
     end
+    self:refreshRegion(region)
 end
 
 -- Reduce the number of stored points for a finished stroke. Points closer than
@@ -575,7 +551,7 @@ function StylusAnnotations:renderStrokeToScreen(stroke)
     self:drawStrokePath(Screen.bb, sph, sw, color, stroke.alpha)
 end
 
-function StylusAnnotations:refreshRegion(region, deferred)
+function StylusAnnotations:refreshRegion(region)
     local function refresh(mode, r)
         if r then
             local rx = math.max(0, math.floor(r.x))
@@ -592,17 +568,11 @@ function StylusAnnotations:refreshRegion(region, deferred)
         UIManager:setDirty(self.view, mode)
     end
 
-    -- Deferred mode (live ink off): nothing touched the panel yet, so show the
-    -- finished stroke instantly on pen-up with the low-latency fast (A2)
-    -- waveform rather than the slower partial (GU16) pass.
-    if deferred then
-        refresh("fast", region)
-        return
-    end
-
-    -- Live mode: the line was already painted while the pen was down, so a fast
-    -- (A2) refresh reveals it immediately on pen-up.
-    refresh("fast", region)
+    -- Deferred (live ink off): nothing touched the panel on pen-up, so a single
+    -- GU16 partial commits the finished stroke in its final grey.
+    -- Live (live ink on): the stroke was already painted by fast A2 commits
+    -- while drawing; a GU16 partial on pen-up crisps it up.
+    refresh("partial", region)
 end
 
 -- Pen-down without drawing for HOLD_TIME_S opens the stroke menu on the
