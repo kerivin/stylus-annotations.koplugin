@@ -46,7 +46,6 @@ local TOOL_TYPE_HIGHLIGHTER = Device.input.TOOL_TYPE_HIGHLIGHTER
 
 local HIT_TEST_THRESHOLD_PX = 25
 local SAVE_DELAY_MS = 800
-local REFINE_DELAY_MS = 700
 local TAP_THRESHOLD_MS = 250
 local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
@@ -444,8 +443,8 @@ function StylusAnnotations:addStrokePoint(x, y)
     -- Live ink: draw the new segment into the shadow immediately so the pen tip
     -- is followed as it moves, then flush an immediate fast refresh to the
     -- panel. The segment bounding box (seg_*) doubles as the pending refresh
-    -- region. endStroke() still redraws/refreshes nothing extra in this mode
-    -- beyond an idempotent fast+partial: it only schedules the crisp partial.
+    -- region. endStroke() redraws/refreshes nothing extra in this mode: the
+    -- fast refresh on pen-up just reveals what was already painted live.
     if self.live_ink ~= false then
         local swz = self:getPageZoom(stroke.page) * stroke.width
         self:drawStrokePath(Screen.bb,
@@ -594,22 +593,16 @@ function StylusAnnotations:refreshRegion(region, deferred)
     end
 
     -- Deferred mode (live ink off): nothing touched the panel yet, so show the
-    -- finished stroke with an immediate partial update on pen-up.
+    -- finished stroke instantly on pen-up with the low-latency fast (A2)
+    -- waveform rather than the slower partial (GU16) pass.
     if deferred then
-        refresh("partial", region)
+        refresh("fast", region)
         return
     end
 
-    -- Live mode: on pen-up show the finished line immediately with the
-    -- low-latency fast (A2) waveform so there is no lag after lifting the pen...
+    -- Live mode: the line was already painted while the pen was down, so a fast
+    -- (A2) refresh reveals it immediately on pen-up.
     refresh("fast", region)
-    -- ...then crisp it up shortly after to clear the A2 residual. The cleanup
-    -- is skipped if the user has already started a new stroke (whose own
-    -- pen-up refresh will crisp it instead).
-    UIManager:scheduleIn(REFINE_DELAY_MS / 1000, function()
-        if self.current_stroke then return end
-        refresh("partial", region)
-    end)
 end
 
 -- Pen-down without drawing for HOLD_TIME_S opens the stroke menu on the
