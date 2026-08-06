@@ -1029,7 +1029,7 @@ function StylusAnnotations:onStrokeTap(ges)
         self.last_tap = nil
         self:onStrokeTapSingle(ges)
     end
-    UIManager:scheduleIn(self.pending_tap_cb, time.ms(PEN_DOUBLE_TAP_INTERVAL_MS))
+    UIManager:scheduleIn(time.ms(PEN_DOUBLE_TAP_INTERVAL_MS), self.pending_tap_cb)
     return true
 end
 
