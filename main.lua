@@ -468,6 +468,16 @@ function StylusAnnotations:startStroke(x, y, tool)
     -- fast-refresh region accumulating while the pen is down.
     self.live_dirty = nil
     self.live_last_x, self.live_last_y = x, y
+    -- Snapshot the clean page before live ink touches it. Every live flush
+    -- restores this region first, so re-applying the stroke never compounds
+    -- (dense pen points must not come out darker).
+    if self.live_ink ~= false then
+        if self.live_snapshot then
+            self.live_snapshot:free()
+            self.live_snapshot = nil
+        end
+        self.live_snapshot = Screen.bb:copy()
+    end
 
     -- While drawing is enabled the stylus callback dominates every event, so
     -- the gesture layer can never see a long-press. Arm a hold check ourselves:
@@ -512,15 +522,13 @@ function StylusAnnotations:addStrokePoint(x, y)
     -- region. endStroke() redraws/refreshes nothing extra in this mode: the
     -- fast refresh on pen-up just reveals what was already painted live.
     --
-    -- NOTE: Like the stable path, each live segment is multiplied into the
-    -- buffer (highlight mechanism) so the page content shows through the ink.
-    -- The pen-up full refresh repaints the finished stroke over a fresh page,
-    -- which also clears any overlap darkening accumulated while drawing.
+    -- NOTE: The live paint re-uses the stable path's highlight mechanism (mask
+    -- multiply) so the page stays visible through the ink. Because multiply
+    -- compounds where it hits already-multiplied pixels, each flush restores
+    -- the region from the pre-stroke snapshot before re-applying the whole
+    -- stroke: no darker dots at dense points, and the finished look matches
+    -- the stroke committed on pen-up.
     if self.live_ink ~= false then
-        local swz = self:getPageZoom(stroke.page) * stroke.width
-        self:drawLiveSegment(
-            self.live_last_x, self.live_last_y, x, y, swz,
-            self:getRenderColor(stroke))
         self.live_last_x, self.live_last_y = x, y
         local ld = self.live_dirty
         if ld then
@@ -532,7 +540,7 @@ function StylusAnnotations:addStrokePoint(x, y)
         else
             self.live_dirty = { x = seg_x, y = seg_y, w = seg_w, h = seg_h }
         end
-        self:flushLive()
+        self:flushLiveStroke(stroke)
     end
 
     self.pen_x, self.pen_y = x, y
@@ -562,9 +570,46 @@ function StylusAnnotations:flushLive()
     end
 end
 
+-- Restore the whole stroke bbox from the pre-stroke snapshot, re-apply the
+-- stroke once (stable highlight mechanism), then fast-refresh the region.
+-- renderStrokeToScreen paints the ENTIRE stroke on every flush, so only the
+-- newest segment region can be restored: any earlier segment still carries its
+-- multiply from the previous flush and would be multiplied again when repainted,
+-- coming out darker at dense points. Restoring the full stroke bbox (padded by
+-- half the stroke width) makes the repaint idempotent. The refresh region is
+-- the union of that restored bbox and the pending segment region.
+function StylusAnnotations:flushLiveStroke(stroke)
+    local ld = self.live_dirty
+    if not ld or ld.w <= 0 or ld.h <= 0 then return end
+    local bb = Screen.bb
+    local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
+    if not x0 then return end
+    local pad = math.ceil(self:getStrokeScreenWidth(stroke) / 2)
+    x0 = math.max(0, math.floor(x0 - pad))
+    y0 = math.max(0, math.floor(y0 - pad))
+    x1 = math.min(bb:getWidth() - 1, math.ceil(x1 + pad))
+    y1 = math.min(bb:getHeight() - 1, math.ceil(y1 + pad))
+    local rw = x1 - x0 + 1
+    local rh = y1 - y0 + 1
+    if self.live_snapshot then
+        bb:blitFrom(self.live_snapshot, x0, y0, x0, y0, rw, rh)
+    end
+    local x2 = math.min(ld.x, x0)
+    local y2 = math.min(ld.y, y0)
+    local w2 = math.max(ld.x + ld.w, x0 + rw) - x2
+    local h2 = math.max(ld.y + ld.h, y0 + rh) - y2
+    self.live_dirty = { x = x2, y = y2, w = w2, h = h2 }
+    self:renderStrokeToScreen(stroke)
+    self:flushLive()
+end
+
 -- Drop any pending live refresh state (called on pen-up).
 function StylusAnnotations:cancelLive()
     self.live_dirty = nil
+    if self.live_snapshot then
+        self.live_snapshot:free()
+        self.live_snapshot = nil
+    end
     if self.refresh_timer then
         UIManager:unschedule(self.refresh_timer)
         self.refresh_timer = nil
@@ -694,10 +739,17 @@ function StylusAnnotations:onStrokeHoldTimer()
     if dx * dx + dy * dy > HOLD_MOVE_THRESHOLD_PX * HOLD_MOVE_THRESHOLD_PX then return end
     -- Long-press: cancel the stillborn stroke, repaint to erase the live dot,
     -- then open the stroke menu.
+    self:onStrokeCancel()
+    self:showStrokeMenuAt(self.hold_start_x, self.hold_start_y)
+end
+
+-- Abort the stroke currently being drawn, dropping any live ink state and
+-- repainting to erase the live dot.
+function StylusAnnotations:onStrokeCancel()
     self.current_stroke = nil
     self.dirty_region = nil
+    self:cancelLive()
     UIManager:setDirty(self.view, "partial")
-    self:showStrokeMenuAt(self.hold_start_x, self.hold_start_y)
 end
 
 function StylusAnnotations:showStrokeMenuAt(x, y)
@@ -882,19 +934,6 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color)
         bb:blitFrom(mask, box_x, box_y, 0, 0, box_w, box_h, bb.setPixelMultiply)
     end
     mask:free()
-end
-
--- Draw a single live segment using the same highlight mechanism as the stable
--- path: stamp the segment into a white mask, then multiply it into the buffer
--- (or over-blend the pre-inverted color on an inverted buffer). A direct opaque
--- paint would block the page content; this lets it show through the highlight
--- color, matching the finished stroke.
-function StylusAnnotations:drawLiveSegment(x1, y1, x2, y2, sw, color)
-    local bb = Screen.bb
-    self:drawStrokePath(bb, {
-        { x = x1, y = y1 },
-        { x = x2, y = y2 },
-    }, sw, color)
 end
 
 function StylusAnnotations:getPageZoom(page)
