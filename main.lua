@@ -572,21 +572,26 @@ function StylusAnnotations:getStrokeScreenWidth(stroke)
     return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
 end
 
-function StylusAnnotations:getRenderColor(stroke)
-    local hex = COLOR_HEX[stroke.color]
-    local color
-    if hex then
-        color = Blitbuffer.colorFromString(hex)
-        if Screen.night_mode then
-            local r, g, b = hex:match("#(..)(..)(..)")
-            color = Blitbuffer.colorFromString(string.format("#%02x%02x%02x",
-                255 - tonumber(r, 16), 255 - tonumber(g, 16), 255 - tonumber(b, 16)))
-        end
-    else
-        color = self.ui.highlight
-            and self.ui.highlight:getHighlightColor(stroke.color)
-            or Blitbuffer.COLOR_BLACK
+-- Resolve a palette color exactly the way ReaderHighlight does for text
+-- highlights, so the annotation color (and its menu swatch) is identical to the
+-- highlight color. black/white come from EXTRA_COLORS and aren't in the
+-- highlight palette, so keep those as concrete COLOR_HEX values; everything
+-- else goes through the highlight's getHighlightColor (which, notably, renders
+-- "gray" as a light gray based on the highlight lighten factor, not a mid-gray).
+function StylusAnnotations:getPaletteColor(name)
+    if name == "black" or name == "white" then
+        local hex = COLOR_HEX[name]
+        return hex and Blitbuffer.colorFromString(hex) or Blitbuffer.COLOR_BLACK
     end
+    if self.ui.highlight then
+        return self.ui.highlight:getHighlightColor(name, nil, Screen.night_mode)
+    end
+    local hex = COLOR_HEX[name]
+    return hex and Blitbuffer.colorFromString(hex) or Blitbuffer.COLOR_BLACK
+end
+
+function StylusAnnotations:getRenderColor(stroke)
+    local color = self:getPaletteColor(stroke.color)
     local rgb = color:getColorRGB32()
     local alpha = math.floor((stroke.alpha or 1.0) * 255)
     return Blitbuffer.ColorRGB32(rgb.r, rgb.g, rgb.b, alpha)
@@ -692,34 +697,75 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
     local n = #sph
     if n == 0 then return end
     local half = math.floor(sw / 2)
-    local function stamp(sx, sy)
-        bb:blendRectRGB32(math.floor(sx) - half, math.floor(sy) - half, sw, sw, color)
+    local function stamp(mask, sx, sy)
+        mask:paintRectRGB32(
+            math.floor(sx) - half, math.floor(sy) - half, sw, sw, color)
     end
+    -- Compute the stroke's screen bounding box (padded by the stamp radius) so
+    -- we only touch the region that the stroke actually covers.
+    local min_x, min_y, max_x, max_y
+    for i = 1, n do
+        local px, py = sph[i].x, sph[i].y
+        if not min_x or px < min_x then min_x = px end
+        if not max_x or px > max_x then max_x = px end
+        if not min_y or py < min_y then min_y = py end
+        if not max_y or py > max_y then max_y = py end
+    end
+    local box_x = math.max(0, math.floor(min_x - half))
+    local box_y = math.max(0, math.floor(min_y - half))
+    local box_w = math.ceil(max_x + half) - box_x
+    local box_h = math.ceil(max_y + half) - box_y
+    if box_w <= 0 or box_h <= 0 then return end
+    box_w = math.min(bb:getWidth() - box_x, box_w)
+    box_h = math.min(bb:getHeight() - box_y, box_h)
+    if box_w <= 0 or box_h <= 0 then return end
+
+    -- Plan a single multiply pass over the box (matching how text highlights
+    -- apply their color). We must NOT multiplyRect the stamps individually, or
+    -- overlapping stamps compound and darken the stroke far past the chosen
+    -- color. Instead, paint the stroke shape once into an all-white scratch
+    -- buffer (paintRectRGB overwrites, so overlaps never accumulate), then
+    -- multiply the affected area of the real buffer by it in one pass.
+    local mask = Blitbuffer.new(box_w, box_h, bb:getType())
+    if not mask then return end
+    mask:paintRect(0, 0, box_w, box_h, Blitbuffer.COLOR_WHITE)
+
     if n == 1 then
-        stamp(sph[1].x, sph[1].y)
-        return
-    end
-    -- Draw a connected thick polyline: march an overlapping stamp along every
-    -- segment between consecutive points (not isolated per-sample dots), so the
-    -- stroke reads as a continuous line through all captured digitizer positions.
-    local x1, y1 = sph[1].x, sph[1].y
-    stamp(x1, y1)
-    for i = 2, n do
-        local x2, y2 = sph[i].x, sph[i].y
-        local dx, dy = x2 - x1, y2 - y1
-        local dist_sq = dx * dx + dy * dy
-        if dist_sq >= 1 then
-            local steps = math.ceil(math.sqrt(dist_sq))
-            for s = 1, steps do
-                stamp(x1 + dx * (s / steps), y1 + dy * (s / steps))
+        stamp(mask, sph[1].x - box_x, sph[1].y - box_y)
+    else
+        local x1, y1 = sph[1].x, sph[1].y
+        stamp(mask, x1 - box_x, y1 - box_y)
+        for i = 2, n do
+            local x2, y2 = sph[i].x, sph[i].y
+            local dx, dy = x2 - x1, y2 - y1
+            local dist_sq = dx * dx + dy * dy
+            if dist_sq >= 1 then
+                local steps = math.ceil(math.sqrt(dist_sq))
+                for s = 1, steps do
+                    stamp(mask, x1 - box_x + dx * (s / steps), y1 - box_y + dy * (s / steps))
+                end
+            else
+                stamp(mask, x2 - box_x, y2 - box_y)
             end
-        else
-            -- Sub-pixel segment (slow movement): stamp the endpoint so the
-            -- stroke stays continuous; otherwise such points draw no ink at all.
-            stamp(x2, y2)
+            x1, y1 = x2, y2
         end
-        x1, y1 = x2, y2
     end
+
+    -- Apply the whole stroke as one multiply over the paper. blitFrom with a
+    -- setPixelMultiply setter multiplies each destination pixel once by the
+    -- mask pixel (white = x1; the painted color multiplies where the stroke
+    -- is), so the selected color blends with the content in a single pass,
+    -- exactly like a text highlight -- no compounding.
+    if bb:getInverse() == 1 then
+        -- multiply can't work on an inverted buffer; fall back to OVER-blend of
+        -- the pre-inverted color, mirroring the highlight drawer.
+        local rb = color:getColorRGB32()
+        local inv = Blitbuffer.ColorRGB32(rb.r, rb.g, rb.b, 0xFF):invert()
+        bb:blendRectRGB32(box_x, box_y, box_w, box_h, inv)
+    else
+        bb:blitFrom(mask, box_x, box_y, 0, 0, box_w, box_h, bb.setPixelMultiply)
+    end
+    mask:free()
 end
 
 function StylusAnnotations:getPageZoom(page)
@@ -940,7 +986,7 @@ function StylusAnnotations:chooseStrokeColor(stroke)
     local color_selector
     local bg_colors = {}
     for i, c in ipairs(COLOR_PALETTE) do
-        bg_colors[i] = Blitbuffer.colorFromString(COLOR_HEX[c[2]] or "#808080")
+        bg_colors[i] = self:getPaletteColor(c[2])
     end
     color_selector = ButtonSelector:new{
         current_value = stroke.color,
@@ -960,7 +1006,7 @@ function StylusAnnotations:choosePenColor()
     local color_selector
     local bg_colors = {}
     for i, c in ipairs(COLOR_PALETTE) do
-        bg_colors[i] = Blitbuffer.colorFromString(COLOR_HEX[c[2]] or "#808080")
+        bg_colors[i] = self:getPaletteColor(c[2])
     end
     color_selector = ButtonSelector:new{
         current_value = self.color,
