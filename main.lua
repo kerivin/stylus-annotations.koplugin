@@ -34,7 +34,6 @@ local SpinWidget = require("ui/widget/spinwidget")
 local Widget = require("ui/widget/widget")
 local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
-local Geom = require("ui/geometry")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local dbg = require("dbg")
@@ -464,12 +463,10 @@ function StylusAnnotations:startStroke(x, y, tool)
         self.refresh_timer = nil
     end
 
-    -- Live-ink state: track where we last drew on the screen and the pending
-    -- fast-refresh region accumulating while the pen is down.
+    -- Live-ink state: track the pending fast-refresh region while the pen is down.
     self.live_dirty = nil
-    self.live_last_x, self.live_last_y = x, y
-    -- Snapshot the clean page before live ink touches it. Every live flush
-    -- restores this region first, so re-applying the stroke never compounds
+    -- Snapshot the clean page before live ink touches it; every live flush
+    -- restores from it so re-applying the stroke can't compound the multiply
     -- (dense pen points must not come out darker).
     if self.live_ink ~= false then
         if self.live_snapshot then
@@ -479,9 +476,9 @@ function StylusAnnotations:startStroke(x, y, tool)
         self.live_snapshot = Screen.bb:copy()
     end
 
-    -- While drawing is enabled the stylus callback dominates every event, so
-    -- the gesture layer can never see a long-press. Arm a hold check ourselves:
-    -- a pen held still (without drawing) opens the stroke menu instead.
+    -- The stylus callback dominates all events while drawing, so the global
+    -- gesture layer never sees a long-press. Arm a hold check ourselves: a pen
+    -- held still (without drawing) opens the stroke menu instead.
     self.hold_start_x, self.hold_start_y = x, y
     if self.hold_timer then
         UIManager:unschedule(self.hold_timer)
@@ -503,11 +500,8 @@ function StylusAnnotations:addStrokePoint(x, y)
     if last and last.x == pos.x and last.y == pos.y then return end
     table.insert(stroke.points, { x = pos.x, y = pos.y })
 
-    -- Instant-ink: while the pen is down we only buffer the point and track the
-    -- stroke's bounding box; nothing is drawn or committed to the panel. This
-    -- panel settles region waves far too slowly to show per-point ink smoothly,
-    -- so all panel work is deferred to endStroke(), which renders the whole
-    -- stroke as a smooth spline into the shadow and refreshes it once.
+    -- Buffer the point and track the stroke's bounding box; panel work is
+    -- deferred to endStroke() which renders the whole stroke and refreshes once.
     local sw = self:getStrokeScreenWidth(stroke)
     local half = math.floor(sw / 2)
     local seg_x = math.min(self.pen_x, x) - half
@@ -516,30 +510,13 @@ function StylusAnnotations:addStrokePoint(x, y)
     local seg_h = math.abs(y - self.pen_y) + sw
     self:accumulateDirty(seg_x, seg_y, seg_w, seg_h)
 
-    -- Live ink: draw the new segment into the shadow immediately so the pen tip
-    -- is followed as it moves, then flush an immediate fast refresh to the
-    -- panel. The segment bounding box (seg_*) doubles as the pending refresh
-    -- region. endStroke() redraws/refreshes nothing extra in this mode: the
-    -- fast refresh on pen-up just reveals what was already painted live.
-    --
-    -- NOTE: The live paint re-uses the stable path's highlight mechanism (mask
-    -- multiply) so the page stays visible through the ink. Because multiply
-    -- compounds where it hits already-multiplied pixels, each flush restores
-    -- the region from the pre-stroke snapshot before re-applying the whole
-    -- stroke: no darker dots at dense points, and the finished look matches
-    -- the stroke committed on pen-up.
+    -- Live ink: draw the new segment immediately and fast-refresh it so the pen
+    -- tip is followed as it moves. The live paint re-uses the stable highlight
+    -- mechanism (mask multiply) so the page stays visible through the ink.
+    -- Because multiply compounds on already-multiplied pixels, each flush
+    -- restores from the snapshot before re-applying the whole stroke.
     if self.live_ink ~= false then
-        self.live_last_x, self.live_last_y = x, y
-        local ld = self.live_dirty
-        if ld then
-            local x0 = math.min(ld.x, seg_x)
-            local y0 = math.min(ld.y, seg_y)
-            local x1 = math.max(ld.x + ld.w, seg_x + seg_w)
-            local y1 = math.max(ld.y + ld.h, seg_y + seg_h)
-            self.live_dirty = { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
-        else
-            self.live_dirty = { x = seg_x, y = seg_y, w = seg_w, h = seg_h }
-        end
+        self.live_dirty = self:mergeRect(self.live_dirty, seg_x, seg_y, seg_w, seg_h)
         self:flushLiveStroke(stroke)
     end
 
@@ -559,11 +536,9 @@ function StylusAnnotations:flushLive()
     local ld = self.live_dirty
     if not ld or ld.w <= 0 or ld.h <= 0 then return end
     self.live_dirty = nil
-    local rx = math.max(0, math.floor(ld.x))
-    local ry = math.max(0, math.floor(ld.y))
-    local rw = math.min(Screen:getWidth() - rx, math.ceil(ld.w))
-    local rh = math.min(Screen:getHeight() - ry, math.ceil(ld.h))
-    if rw > 0 and rh > 0 then
+    local rx, ry, rw, rh = self:clampRegion(
+        ld.x, ld.y, ld.w, ld.h, Screen:getWidth(), Screen:getHeight())
+    if rx then
         UIManager:setDirty(self.view, function()
             return "fast", Geom:new{x = rx, y = ry, w = rw, h = rh}
         end)
@@ -572,12 +547,10 @@ end
 
 -- Restore the whole stroke bbox from the pre-stroke snapshot, re-apply the
 -- stroke once (stable highlight mechanism), then fast-refresh the region.
--- renderStrokeToScreen paints the ENTIRE stroke on every flush, so only the
--- newest segment region can be restored: any earlier segment still carries its
--- multiply from the previous flush and would be multiplied again when repainted,
--- coming out darker at dense points. Restoring the full stroke bbox (padded by
--- half the stroke width) makes the repaint idempotent. The refresh region is
--- the union of that restored bbox and the pending segment region.
+-- renderStrokeToScreen repaints the entire stroke, so restoring only the newest
+-- segment region would re-multiply earlier segments (darker at dense points);
+-- restoring the full bbox (padded by half the stroke width) keeps it idempotent.
+-- The refresh region is the union of that bbox and the pending segment region.
 function StylusAnnotations:flushLiveStroke(stroke)
     local ld = self.live_dirty
     if not ld or ld.w <= 0 or ld.h <= 0 then return end
@@ -594,11 +567,7 @@ function StylusAnnotations:flushLiveStroke(stroke)
     if self.live_snapshot then
         bb:blitFrom(self.live_snapshot, x0, y0, x0, y0, rw, rh)
     end
-    local x2 = math.min(ld.x, x0)
-    local y2 = math.min(ld.y, y0)
-    local w2 = math.max(ld.x + ld.w, x0 + rw) - x2
-    local h2 = math.max(ld.y + ld.h, y0 + rh) - y2
-    self.live_dirty = { x = x2, y = y2, w = w2, h = h2 }
+    self.live_dirty = self:mergeRect(ld, x0, y0, rw, rh)
     self:renderStrokeToScreen(stroke)
     self:flushLive()
 end
@@ -637,27 +606,22 @@ function StylusAnnotations:endStroke()
     self:scheduleSave()
 
     self:cancelLive()
-    -- Live ink already painted the buffer while the pen was down, so skip the
-    -- (re-blending) full render. In the deferred mode nothing touched the panel
-    -- yet, so render first, then do the crisp partial on pen-up either way.
+    -- Live ink already painted the buffer, so skip the re-blend; the deferred
+    -- mode needs a full render since nothing touched the panel yet.
     if self.live_ink == false then
         self:renderStrokeToScreen(stroke)
     end
-    -- Commit the stroke with a partial refresh, and when live ink is on also
-    -- schedule a full-screen refresh shortly after the pen lifts. The fast (A2)
-    -- commits used while drawing leave residue that a plain partial can't fully
-    -- clear on this panel; the deferred full wave lands once drawing has stopped.
+    -- Commit with a partial refresh; live ink also queues a full refresh once
+    -- the pen lifts, because the fast (A2) commits leave residue a partial
+    -- can't clear on this panel.
     self:refreshRegion(region)
     if self.live_ink ~= false then
         self:scheduleRefresh()
     end
 end
 
--- Deferred full refresh: queued on pen-up and re-armed on any further stroke
--- activity, so a burst of strokes still ends with a final clean refresh. The
--- live stroking uses fast (A2) commits which leave residue that a region partial
--- does NOT purge on this panel; only a stronger full-screen waveform clears it,
--- exactly like a page turn.
+-- Full refresh queued on pen-up, re-armed on any further stroke activity so a
+-- burst of strokes still ends with a final clean screen.
 function StylusAnnotations:scheduleRefresh()
     if self.refresh_timer then
         UIManager:unschedule(self.refresh_timer)
@@ -670,10 +634,8 @@ function StylusAnnotations:scheduleRefresh()
     UIManager:scheduleIn(LIVE_REFRESH_DELAY_S, refresh_timer)
 end
 
--- Reduce the number of stored points for a finished stroke. Points closer than
--- MIN_SPACING screen pixels to the last kept point are dropped (measured in
--- screen space via pageToScreenPoint so the threshold is resolution-independent).
--- First and last points are always kept so the stroke endpoints stay exact.
+-- Drop points closer than MIN_SPACING screen pixels to the last kept one
+-- (resolution-independent via pageToScreenPoint); first and last are kept.
 function StylusAnnotations:decimatePoints(stroke)
     local pts = stroke.points
     local n = #pts
@@ -709,16 +671,13 @@ function StylusAnnotations:renderStrokeToScreen(stroke)
 end
 
 function StylusAnnotations:refreshRegion(region)
-    -- Commit the finished stroke with a crisp GU16 partial. With live ink on the
-    -- stroke was already painted by fast A2 commits while drawing; this partial
-    -- crisps it up. With live ink off nothing touched the panel until now, so the
-    -- partial reveals the freshly rendered stroke.
+    -- Crisp GU16 partial. With live ink on the stroke was already painted by the
+    -- fast A2 commits while drawing; with live ink off this reveals the fresh
+    -- stroke rendered just now.
     if region then
-        local rx = math.max(0, math.floor(region.x))
-        local ry = math.max(0, math.floor(region.y))
-        local rw = math.min(Screen:getWidth() - rx, math.ceil(region.w))
-        local rh = math.min(Screen:getHeight() - ry, math.ceil(region.h))
-        if rw > 0 and rh > 0 then
+        local rx, ry, rw, rh = self:clampRegion(
+            region.x, region.y, region.w, region.h, Screen:getWidth(), Screen:getHeight())
+        if rx then
             UIManager:setDirty(self.view, function()
                 return "partial", Geom:new{x = rx, y = ry, w = rw, h = rh}
             end)
@@ -728,17 +687,14 @@ function StylusAnnotations:refreshRegion(region)
     UIManager:setDirty(self.view, "partial")
 end
 
--- Pen-down without drawing for HOLD_TIME_S opens the stroke menu on the
--- annotation under the pen (cancelling the stillborn dot stroke).
+-- Pen held still (no drawing) for HOLD_TIME_S: treat as a long-press and open
+-- the stroke menu on the annotation under the pen.
 function StylusAnnotations:onStrokeHoldTimer()
     local stroke = self.current_stroke
     if not stroke then return end
     local dx = self.pen_x - self.hold_start_x
     local dy = self.pen_y - self.hold_start_y
-    -- Pen actually moved: this is a (slow) stroke, not a long-press.
     if dx * dx + dy * dy > HOLD_MOVE_THRESHOLD_PX * HOLD_MOVE_THRESHOLD_PX then return end
-    -- Long-press: cancel the stillborn stroke, repaint to erase the live dot,
-    -- then open the stroke menu.
     self:onStrokeCancel()
     self:showStrokeMenuAt(self.hold_start_x, self.hold_start_y)
 end
@@ -781,16 +737,28 @@ function StylusAnnotations:getRenderColor(stroke)
 end
 
 function StylusAnnotations:accumulateDirty(x, y, w, h)
-    if not self.dirty_region then
-        self.dirty_region = { x = x, y = y, w = w, h = h }
-    else
-        local r = self.dirty_region
-        local x0 = math.min(r.x, x)
-        local y0 = math.min(r.y, y)
-        local x1 = math.max(r.x + r.w, x + w)
-        local y1 = math.max(r.y + r.h, y + h)
-        self.dirty_region = { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
-    end
+    self.dirty_region = self:mergeRect(self.dirty_region, x, y, w, h)
+end
+
+-- Union two rectangles (region may be nil): returns {x, y, w, h}.
+function StylusAnnotations:mergeRect(region, x, y, w, h)
+    if not region then return { x = x, y = y, w = w, h = h } end
+    local x0 = math.min(region.x, x)
+    local y0 = math.min(region.y, y)
+    local x1 = math.max(region.x + region.w, x + w)
+    local y1 = math.max(region.y + region.h, y + h)
+    return { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
+end
+
+-- Clamp a region to the screen and coerce to integer bounds. Returns nil when
+-- nothing would be visible.
+function StylusAnnotations:clampRegion(x, y, w, h, width, height)
+    local rx = math.max(0, math.floor(x))
+    local ry = math.max(0, math.floor(y))
+    local rw = math.min(width - rx, math.ceil(w))
+    local rh = math.min(height - ry, math.ceil(h))
+    if rw <= 0 or rh <= 0 then return end
+    return rx, ry, rw, rh
 end
 
 --------------------------------------------------------------------------------
@@ -810,18 +778,11 @@ function StylusAnnotations:paintTo(bb, x, y)
         self:paintStroke(bb, x, y, self.current_stroke)
     end
     -- Draw the selection last so a repaint (e.g. the finger-tap path) redraws
-    -- the box instead of wiping it. Screen.bb is a blitbuffer with :invertRect.
+    -- the box instead of wiping it.
     if self.selected_stroke then
-        local x0, y0, x1, y1 = self:getStrokeScreenBox(self.selected_stroke)
-        if x0 then
-            local pad = math.max(4, math.floor(self.selected_stroke.width * (self.selected_stroke.zoom or 1)) + 2)
-            local rx = math.max(0, math.floor(x0 - pad))
-            local ry = math.max(0, math.floor(y0 - pad))
-            local rw = math.min(bb:getWidth() - rx, math.ceil((x1 - x0) + 2 * pad))
-            local rh = math.min(bb:getHeight() - ry, math.ceil((y1 - y0) + 2 * pad))
-            if rw > 0 and rh > 0 then
-                bb:invertRect(rx, ry, rw, rh)
-            end
+        local rx, ry, rw, rh = self:getSelectionRect(self.selected_stroke, bb:getWidth(), bb:getHeight())
+        if rx then
+            bb:invertRect(rx, ry, rw, rh)
         end
     end
 end
@@ -869,6 +830,15 @@ function StylusAnnotations:getStrokeScreenBox(stroke)
         if not y1 or sy > y1 then y1 = sy end
     end
     return x0, y0, x1, y1
+end
+
+-- Screen rect of the stroke's bbox padded to cover its full width, clamped to
+-- the given dimensions. Used for the inverted selection box.
+function StylusAnnotations:getSelectionRect(stroke, width, height)
+    local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
+    if not x0 then return end
+    local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
+    return self:clampRegion(x0 - pad, y0 - pad, (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad, width, height)
 end
 
 -- Render a stroke as a connected thick polyline along its screen points.
@@ -1125,38 +1095,20 @@ end
 function StylusAnnotations:paintSelectionToScreen()
     local stroke = self.selected_stroke
     if not stroke then return end
-    local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
-    if not x0 then return end
-    local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
-    local rx = math.max(0, math.floor(x0 - pad))
-    local ry = math.max(0, math.floor(y0 - pad))
-    local rw = math.min(Screen:getWidth() - rx, math.ceil((x1 - x0) + 2 * pad))
-    local rh = math.min(Screen:getHeight() - ry, math.ceil((y1 - y0) + 2 * pad))
-    if rw <= 0 or rh <= 0 then return end
+    local rx, ry, rw, rh = self:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
+    if not rx then return end
     Screen.bb:invertRect(rx, ry, rw, rh)
     self:refreshRegion({ x = rx, y = ry, w = rw, h = rh })
 end
 
 function StylusAnnotations:showStrokeMenu(stroke)
-    -- Always show which stroke the menu applies to, whichever gesture opened it
-    -- (finger tap or stylus long-press).
     self:setSelection(stroke)
-    -- Same widget & layout as the text-highlight edit popup
-    -- (ReaderHighlight:showHighlightDialog): a rounded ButtonDialog whose first
-    -- row is the trash/deletion icon plus the per-item actions.
     local dialog
-    -- Anchor the popup to the stroke's screen box so it pops up or down next to
-    -- the stroke instead of covering it (mirroring ReaderHighlight's anchored
-    -- highlight dialog). Falls back to the default centered position if the
-    -- stroke isn't currently on screen.
     dialog = ButtonDialog:new{
         width_factor = 0.45,
         anchor = function()
             local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
             if not x0 then return end
-            -- pageToScreenPoint returns coords relative to the view widget, which
-            -- sits at the top-left of the screen here; pad the box so the popup
-            -- gets a little clearance from the ink.
             local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
             return { x = x0 - pad, y = y0 - pad, w = (x1 - x0) + 2 * pad, h = (y1 - y0) + 2 * pad }
         end,
@@ -1192,7 +1144,6 @@ function StylusAnnotations:showStrokeMenu(stroke)
             },
         },
     }
-    self.stroke_dialog = dialog
     UIManager:show(dialog, "[ui]")
 end
 
