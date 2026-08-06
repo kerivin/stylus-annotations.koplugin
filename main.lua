@@ -29,6 +29,10 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local ReaderHighlight = require("apps/reader/modules/readerhighlight")
 local ButtonDialog = require("ui/widget/buttondialog")
 local ButtonSelector = require("ui/widget/buttonselector")
+local InputDialog = require("ui/widget/inputdialog")
+local SpinWidget = require("ui/widget/spinwidget")
+local Widget = require("ui/widget/widget")
+local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
 local Geom = require("ui/geometry")
 local lfs = require("libs/libkoreader-lfs")
@@ -36,6 +40,7 @@ local logger = require("logger")
 local dbg = require("dbg")
 local _ = require("gettext")
 local T = require("ffi/util").template
+local time = require("ui/time")
 
 local Screen = Device.screen
 
@@ -47,12 +52,60 @@ local SAVE_DELAY_MS = 800
 local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_DELAY_S = 0.7
+local PEN_DOUBLE_TAP_INTERVAL_MS = 350
+local PEN_DOUBLE_TAP_DISTANCE_PX = 60
 
 local DEFAULT_WIDTH = 2
 local DEFAULT_HIGHLIGHTER_WIDTH = 20
 local DEFAULT_COLOR = "orange"
 
 local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
+
+-- A horizontal stroke preview used by the Width picker. `get_width` is called
+-- on every paint so the line echoes the currently chosen width while spinning.
+local PREVIEW_POINTS = {
+    {10.8,1.1}, {8.3,4.3}, {6.2,14.0}, {4.3,28.0}, {2.9,40.9}, {1.4,55.9},
+    {0.4,68.8}, {0.0,81.7}, {0.4,94.6}, {2.9,100.0}, {5.2,98.9}, {8.1,92.5},
+    {10.1,86.0}, {12.6,78.5}, {15.1,69.9}, {17.6,61.3}, {20.1,52.7}, {22.6,43.0},
+    {25.1,34.4}, {27.3,25.8}, {29.6,19.4}, {31.7,11.8}, {34.2,5.4}, {36.6,0.0},
+    {38.9,1.1}, {39.3,12.9}, {39.1,26.9}, {38.9,38.7}, {39.1,54.8}, {41.0,66.7},
+    {43.9,68.8}, {46.6,64.5}, {49.5,58.1}, {51.8,51.6}, {53.8,46.2}, {56.5,41.9},
+    {59.2,39.8}, {62.1,43.0}, {64.2,49.5}, {66.5,60.2}, {68.9,66.7}, {72.5,66.7},
+    {74.9,62.4}, {77.8,57.0}, {81.0,49.5}, {84.3,40.9}, {87.6,33.3}, {90.5,28.0},
+    {93.0,22.6}, {95.9,19.4}, {98.1,20.4}, {99.6,31.2}, {100.0,38.7},
+}
+
+-- A horizontal stroke preview used by the Width picker. Draws a hardcoded copy
+-- of a real captured scribble (PREVIEW_POINTS) in black at the current width,
+-- scaled the same way real strokes are (zoom × width), so it matches the page.
+local WidthPreview = Widget:extend{
+    dimen = nil,
+    get_width = function() return 2 end,
+    get_zoom = function() return 1 end,
+    padding = 12,
+    paintTo = function(self, bb, x, y)
+        local w = self:get_width() * self:get_zoom()
+        local pad = self.padding
+        local draw_w = self.dimen.w - 2 * pad
+        local draw_h = self.dimen.h - 2 * pad
+        local half = w / 2
+        -- Map the normalized (0..100) preview path into the widget, preserving
+        -- its 5:1 horizontal aspect, then stamp each segment like real ink.
+        local function sx(v) return x + pad + v / 100 * draw_w end
+        local function sy(v) return y + pad + v / 100 * draw_h end
+        local px, py = sx(PREVIEW_POINTS[1][1]), sy(PREVIEW_POINTS[1][2])
+        for i = 2, #PREVIEW_POINTS do
+            local nx, ny = sx(PREVIEW_POINTS[i][1]), sy(PREVIEW_POINTS[i][2])
+            local dist = math.sqrt((nx - px) ^ 2 + (ny - py) ^ 2)
+            local steps = math.max(1, math.ceil(dist))
+            for s = 1, steps do
+                local tx, ty = px + (nx - px) * (s / steps), py + (ny - py) * (s / steps)
+                bb:paintRectRGB32(math.floor(tx) - half, math.floor(ty) - half, w, w, Blitbuffer.COLOR_BLACK)
+            end
+            px, py = nx, ny
+        end
+    end,
+}
 
 -- Colors offered only by this plugin, kept out of ReaderHighlight's
 -- text-highlight palette. Entries: { localized label, color name, "#RRGGBB" }.
@@ -107,6 +160,13 @@ local StylusAnnotations = InputContainer:extend{
     hold_timer = nil,
     hold_start_x = 0,
     hold_start_y = 0,
+
+    last_pen_lift = nil,         -- { time = fts, x, y } of last pen-up, for pen double-tap
+    last_tap_dot = nil,          -- stroke committed by the first tap of a double-tap
+    double_tap_latched = false,
+
+    last_tap = nil,              -- { time = fts, x, y } of last finger tap, for double-tap
+    pending_tap_cb = nil,        -- deferred single-tap action (cancelled by a double-tap)
 
     selected_stroke = nil,
 
@@ -316,19 +376,64 @@ function StylusAnnotations:onStylusEvent(input, slot)
         -- Contact active (down or move).
         if self.current_stroke then
             self:addStrokePoint(x, y)
+        elseif self:detectPenDoubleTap(x, y) then
+            -- A double-tap on a stroke: delete it instead of starting a new
+            -- stroke (which, as a barely-a-point, would just add a dot).
+            self:onDoubleTap(x, y)
         else
             self:startStroke(x, y, tool)
         end
         self.pen_x, self.pen_y = x, y
     else
         -- Contact lifted: end the stroke. A single point yields a small dot.
-        if self.current_stroke then
+        local ended = self.current_stroke
+        if ended then
             self:endStroke()
+            if #ended.points <= 1 then
+                -- A tap (single point): remember it so a following double-tap can
+                -- drop this stillborn dot before hit-testing the stroke below it.
+                self.last_tap_dot = ended
+            end
+        else
+            self.last_tap_dot = nil
         end
+        self.last_pen_lift = { time = time.monotonic(), x = x, y = y }
     end
 
     -- Dominate: keep this pen event away from gesture detection.
     return true
+end
+
+-- A pen-down that immediately follows a recent pen-up nearby is a double-tap
+-- (drawing keeps the pen away from the global gesture detector, so we must
+-- recognize it ourselves). Only once: the next pen-down clears the latch.
+function StylusAnnotations:detectPenDoubleTap(x, y)
+    local last = self.last_pen_lift
+    self.last_pen_lift = nil
+    if not last then return false end
+    if self.double_tap_latched then
+        self.double_tap_latched = false
+        return false
+    end
+    local dt_ms = time.to_ms(time.monotonic() - last.time)
+    if dt_ms > PEN_DOUBLE_TAP_INTERVAL_MS then return false end
+    if math.abs(x - last.x) > PEN_DOUBLE_TAP_DISTANCE_PX
+        or math.abs(y - last.y) > PEN_DOUBLE_TAP_DISTANCE_PX then return false end
+    self.double_tap_latched = true
+    return true
+end
+
+function StylusAnnotations:onDoubleTap(x, y)
+    -- The first tap of the double-tap committed a stillborn dot at this spot;
+    -- drop it so the hit-test finds the real stroke underneath it.
+    if self.last_tap_dot then
+        self:deleteStroke(self.last_tap_dot)
+        self.last_tap_dot = nil
+    end
+    local stroke = self:findStrokeAt({ pos = { x = x, y = y } })
+    if stroke then
+        self:deleteStroke(stroke)
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -873,12 +978,18 @@ function StylusAnnotations:setupTouchZones()
                 return self:onStrokeTap(ges)
             end,
         },
+        -- Fires when the user has NOT disabled the native double_tap gesture
+        -- (Input.disable_double_tap = false): the detector emits a `double_tap`
+        -- gesture and defers `tap`, so we need this zone to catch the delete.
         {
             id = "stylus_annotations_double_tap",
             ges = "double_tap",
             screen_zone = {
                 ratio_x = 0, ratio_y = 0,
                 ratio_w = 1, ratio_h = 1,
+            },
+            overrides = {
+                "stylus_annotations_tap",
             },
             handler = function(ges)
                 return self:onStrokeDoubleTap(ges)
@@ -888,8 +999,50 @@ function StylusAnnotations:setupTouchZones()
     self.touch_zones_registered = true
 end
 
+-- The device's global double_tap gesture is disabled by default
+-- (Input.disable_double_tap = true), so the double_tap touch zone never fires.
+-- Here we detect a double tap from two consecutive quick `tap` gestures, and
+-- only fire the single-tap action after a short deferral so a quick second tap
+-- can supersede it (mirroring the disabled native double-tap window).
 function StylusAnnotations:onStrokeTap(ges)
     if self:isOverlayActive() then return false end
+    local now = time.monotonic()
+    local on_stroke = self:findStrokeAt(ges) ~= nil
+    if not on_stroke then
+        -- Normal reading gesture on empty space: let the reader handle it.
+        self:clearPendingSingleTap()
+        self.last_tap = nil
+        return false
+    end
+    if self.last_tap and
+       now - self.last_tap.time <= time.ms(PEN_DOUBLE_TAP_INTERVAL_MS) and
+       math.abs(ges.pos.x - self.last_tap.x) <= PEN_DOUBLE_TAP_DISTANCE_PX and
+       math.abs(ges.pos.y - self.last_tap.y) <= PEN_DOUBLE_TAP_DISTANCE_PX then
+        self:clearPendingSingleTap()
+        self.last_tap = nil
+        return self:onStrokeDoubleTap(ges)
+    end
+    -- Not (yet) a double tap: ask for a single-tap; defer actually showing the
+    -- stroke menu so a quick second tap can turn this into a delete.
+    self.last_tap = { time = now, x = ges.pos.x, y = ges.pos.y }
+    if self.pending_tap_cb then UIManager:unschedule(self.pending_tap_cb) end
+    self.pending_tap_cb = function()
+        self.pending_tap_cb = nil
+        self.last_tap = nil
+        self:onStrokeTapSingle(ges)
+    end
+    UIManager:scheduleIn(self.pending_tap_cb, time.ms(PEN_DOUBLE_TAP_INTERVAL_MS))
+    return true
+end
+
+function StylusAnnotations:clearPendingSingleTap()
+    if self.pending_tap_cb then
+        UIManager:unschedule(self.pending_tap_cb)
+        self.pending_tap_cb = nil
+    end
+end
+
+function StylusAnnotations:onStrokeTapSingle(ges)
     local stroke = self:findStrokeAt(ges)
     if not stroke then return false end
     self:setSelection(stroke)
@@ -1206,7 +1359,7 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Live ink refresh"),
+                text = _("Live refresh"),
                 checked_func = function()
                     return self.live_ink ~= false
                 end,
@@ -1215,17 +1368,19 @@ function StylusAnnotations:addToMainMenu(menu_items)
                     self:saveSettings()
                     local state = self.live_ink and _("on") or _("off")
                     UIManager:show(InfoMessage:new{
-                        text = T(_("Live ink refresh: %1"), state),
+                        text = T(_("Live refresh: %1"), state),
                         timeout = 1,
                     })
                 end,
             },
             {
-                text = _("Pen width"),
-                sub_item_table = self:getWidthMenuItems(),
+                text = _("Width..."),
+                callback = function()
+                    self:choosePenWidth()
+                end,
             },
             {
-                text = _("Pen color"),
+                text = _("Color..."),
                 callback = function()
                     self:choosePenColor()
                 end,
@@ -1246,21 +1401,108 @@ function StylusAnnotations:addToMainMenu(menu_items)
     }
 end
 
-function StylusAnnotations:getWidthMenuItems()
-    local items = {}
-    for _, w in ipairs(WIDTH_CHOICES) do
-        items[#items + 1] = {
-            text = tostring(w),
-            checked_func = function()
-                return self.width == w
-            end,
-            callback = function()
-                self.width = w
-                self:saveSettings()
-            end,
-        }
+-- Nicer pen width selector: a SpinWidget stepper seeded at the current width,
+-- with a live stroke-preview widget that thickens/thins as you pick, inserted
+-- above the value row via SpinWidget's addWidget mechanism. Applies on OK.
+-- Entering a custom value re-opens the dialog seeded at that width, so the
+-- preview shows it before the user commits (Apply) or backs out (Close).
+function StylusAnnotations:choosePenWidth(in_value)
+    -- Real strokes render at zoom × width; use the current page's zoom so the
+    -- preview thickness matches what you'd actually draw.
+    local pages = self:getVisiblePages()
+    local zoom = self:getPageZoom(pages and pages[1] or nil)
+    local start = in_value or self.width
+
+    -- Seed the stepper at the current width's position in WIDTH_CHOICES when it
+    -- is one of the presets; otherwise fall back to a free 1–30 range so the
+    -- value (e.g. a previous custom one) is shown verbatim.
+    local index, use_presets = nil, false
+    for i, w in ipairs(WIDTH_CHOICES) do
+        if w == start then index, use_presets = i, true break end
     end
-    return items
+
+    -- NOTE: `spin` must be declared *before* the constructor so the closures
+    -- below capture it as an upvalue. Declaring it as `local spin = ...` would
+    -- make the callback reference the (nil) *global* `spin` and crash on Apply.
+    local spin
+    spin = SpinWidget:new{
+        title_text = _("Width..."),
+        wrap = true,
+        value_table = use_presets and WIDTH_CHOICES or nil,
+        value_index = index,
+        value = start,
+        value_min = 1,
+        value_max = 30,
+        value_step = 1,
+        value_hold_step = 2,
+        precision = "%d",
+        -- Always allow applying the current value (don't grey out Apply just
+        -- because the width didn't change).
+        ok_always_enabled = true,
+        -- Custom entry, alongside the 1/2/3/5/8/12 presets.
+        extra_text = _("Custom..."),
+        extra_callback = function()
+            -- Declare `input_dialog` first so the button closures below capture
+            -- it as an upvalue (see the `spin` note above).
+            local input_dialog
+            input_dialog = InputDialog:new{
+                title = _("Custom width"),
+                input_type = "number",
+                input_hint = T(_("%1 - %2 (current: %3)"), 1, 30, start),
+                buttons = {
+                    {
+                        {
+                            text = _("Cancel"),
+                            id = "close",
+                            callback = function()
+                                UIManager:close(input_dialog)
+                            end,
+                        },
+                        {
+                            text = _("OK"),
+                            is_enter_default = true,
+                            callback = function()
+                                local v = tonumber(input_dialog:getInputText())
+                                if v and v >= 1 and v <= 30 then
+                                    v = math.floor(v + 0.5)
+                                    UIManager:close(input_dialog)
+                                    -- Back to the width widget, seeded at the
+                                    -- custom value, so the user can preview it
+                                    -- before Apply/Close. This re-open also
+                                    -- replaces the previous instance (whose
+                                    -- extra-button auto-close runs after us).
+                                    self:choosePenWidth(v)
+                                else
+                                    UIManager:show(InfoMessage:new{
+                                        text = _("Invalid width (1 - 30)"),
+                                        timeout = 2,
+                                    })
+                                end
+                            end,
+                        },
+                    },
+                },
+            }
+            UIManager:show(input_dialog)
+        end,
+        callback = function()
+            self.width = spin.value_widget:getValue()
+            self:saveSettings()
+        end,
+    }
+    -- Live preview: repaints with the current value on every spin.
+    -- The captured scribble is ~5:1 horizontal (w:h), so size the widget to
+    -- that aspect and keep it fixed; very thick strokes clip at the box edges.
+    local avail_w = spin:getAddedWidgetAvailableWidth()
+    local ph = math.floor(avail_w / 5.2)
+    spin:addWidget(WidthPreview:new{
+        dimen = Geom:new{ w = avail_w, h = ph },
+        get_zoom = function() return zoom end,
+        get_width = function()
+            return spin.value_widget and spin.value_widget:getValue() or self.width
+        end,
+    })
+    UIManager:show(spin)
 end
 
 function StylusAnnotations:deleteAllStrokesOnPage()
