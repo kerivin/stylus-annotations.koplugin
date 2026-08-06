@@ -47,6 +47,7 @@ local HIT_TEST_THRESHOLD_PX = 25
 local SAVE_DELAY_MS = 800
 local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
+local LIVE_REFRESH_DELAY_S = 0.7
 
 local DEFAULT_WIDTH = 2
 local DEFAULT_HIGHLIGHTER_WIDTH = 20
@@ -60,6 +61,12 @@ local EXTRA_COLORS = {
     {_("Black"), "black", "#000000"},
     {_("White"), "white", "#FFFFFF"},
 }
+
+-- Names of the colors offered only by this plugin (for quick membership checks).
+local EXTRA_COLOR_NAMES = {}
+for _, c in ipairs(EXTRA_COLORS) do
+    EXTRA_COLOR_NAMES[c[2]] = true
+end
 
 -- Menu palette: reuse ReaderHighlight's text-highlight colors (so they aren't
 -- duplicated here), extended with our black/white extras.
@@ -90,7 +97,6 @@ local StylusAnnotations = InputContainer:extend{
 
     strokes = nil,
     strokes_by_page = nil,     -- page -> array of indices into self.strokes
-    bookmarked_pages = nil,    -- set of pages we created page-marker bookmarks for
     strokes_loaded = false,
 
     stylus_callback_registered = false,
@@ -108,13 +114,14 @@ local StylusAnnotations = InputContainer:extend{
 
     dirty_region = nil,
 
+    refresh_timer = nil,
+
     pending_save = nil,
 }
 
 function StylusAnnotations:init()
     self.strokes = {}
     self.strokes_by_page = {}
-    self.bookmarked_pages = {}
     self.stroke_id_counter = 0
 
     self:loadSettings()
@@ -354,6 +361,13 @@ function StylusAnnotations:startStroke(x, y, tool)
     self.pen_x, self.pen_y = x, y
     self.dirty_region = nil
 
+    -- A new stroke means drawing is active again: drop any deferred refresh
+    -- scheduled for a previous stroke so it can't fire mid-stroke.
+    if self.refresh_timer then
+        UIManager:unschedule(self.refresh_timer)
+        self.refresh_timer = nil
+    end
+
     -- Live-ink state: track where we last drew on the screen and the pending
     -- fast-refresh region accumulating while the pen is down.
     self.live_dirty = nil
@@ -401,11 +415,16 @@ function StylusAnnotations:addStrokePoint(x, y)
     -- panel. The segment bounding box (seg_*) doubles as the pending refresh
     -- region. endStroke() redraws/refreshes nothing extra in this mode: the
     -- fast refresh on pen-up just reveals what was already painted live.
+    --
+    -- NOTE: This draws each segment by direct paint (an unvarying color), NOT
+    -- by the multiply used in the stable path. Multiply compounds where stamps
+    -- overlap, so slow, dense pen strokes show darker dots; direct paint keeps
+    -- the ink flat and uniform no matter how dense the points get.
     if self.live_ink ~= false then
         local swz = self:getPageZoom(stroke.page) * stroke.width
-        self:drawStrokePath(Screen.bb,
-            { { x = self.live_last_x, y = self.live_last_y }, { x = x, y = y } },
-            swz, self:getRenderColor(stroke), stroke.alpha)
+        self:drawLiveSegment(
+            self.live_last_x, self.live_last_y, x, y, swz,
+            self:getRenderColor(stroke))
         self.live_last_x, self.live_last_y = x, y
         local ld = self.live_dirty
         if ld then
@@ -450,6 +469,10 @@ end
 -- Drop any pending live refresh state (called on pen-up).
 function StylusAnnotations:cancelLive()
     self.live_dirty = nil
+    if self.refresh_timer then
+        UIManager:unschedule(self.refresh_timer)
+        self.refresh_timer = nil
+    end
 end
 
 function StylusAnnotations:endStroke()
@@ -470,7 +493,6 @@ function StylusAnnotations:endStroke()
     self.strokes_by_page[stroke.page] = self.strokes_by_page[stroke.page] or {}
     table.insert(self.strokes_by_page[stroke.page], idx)
 
-    self:ensureBookmark(stroke.page)
     self:scheduleSave()
 
     self:cancelLive()
@@ -480,7 +502,37 @@ function StylusAnnotations:endStroke()
     if self.live_ink == false then
         self:renderStrokeToScreen(stroke)
     end
+    -- Commit the crisp stroke with a partial refresh. When live ink is on, the
+    -- stroke is shown progressively via fast (A2) refreshes; those leave ghost
+    -- trails that a partial on pen-up can clear. To make sure the refresh lands
+    -- even if the pen-up arrives in the middle of a fast-refresh burst, defer
+    -- it slightly and refresh again once the user has stopped drawing.
     self:refreshRegion(region)
+    if self.live_ink ~= false then
+        self:scheduleRefresh(region)
+    end
+end
+
+-- Deferred refresh: re-crisp the last stroke once drawing has stopped.
+-- Scheduled on pen-up and re-armed on any further stroke activity, so a burst
+-- of strokes still ends with a final clean refresh.
+-- NOTE: A plain region "partial" (GU16) does NOT purge the A2/fast residue the
+-- live stroking left behind on this panel. A stronger full-screen wave is
+-- required to clear the trails, so this timer queues a full-viewport refresh and
+-- scrubs the framebuffer's dirty bitmap manually.
+function StylusAnnotations:scheduleRefresh(region)
+    if self.refresh_timer then
+        UIManager:unschedule(self.refresh_timer)
+    end
+    local refresh_timer = function()
+        self.refresh_timer = nil
+        -- The standard "partial" exception targeting a region won't clear A2
+        -- residue. Queue a full refresh: on e-ink that forces a clean waveform
+        -- across the whole viewport, exactly like a page turn does.
+        UIManager:setDirty(self.view, "full")
+    end
+    self.refresh_timer = refresh_timer
+    UIManager:scheduleIn(LIVE_REFRESH_DELAY_S, refresh_timer)
 end
 
 -- Reduce the number of stored points for a finished stroke. Points closer than
@@ -573,10 +625,10 @@ function StylusAnnotations:getStrokeScreenWidth(stroke)
 end
 
 -- Resolve a palette color the same way ReaderHighlight does for text highlights.
--- black/white come from EXTRA_COLORS and aren't in the highlight palette, so use
--- their concrete COLOR_HEX; everything else goes through getHighlightColor.
+-- Colors in EXTRA_COLORS aren't part of the highlight palette, so use their
+-- concrete COLOR_HEX; everything else goes through getHighlightColor.
 function StylusAnnotations:getPaletteColor(name)
-    if name == "black" or name == "white" then
+    if EXTRA_COLOR_NAMES[name] then
         local hex = COLOR_HEX[name]
         return hex and Blitbuffer.colorFromString(hex) or Blitbuffer.COLOR_BLACK
     end
@@ -749,6 +801,30 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
         bb:blitFrom(mask, box_x, box_y, 0, 0, box_w, box_h, bb.setPixelMultiply)
     end
     mask:free()
+end
+
+-- Draw a single live segment directly into the framebuffer. Unlike drawStrokePath
+-- (which multiplies a pre-stamped mask so overlapping stamps compound darker at
+-- dense points), this paints each stamp with the unvarying render color, so the
+-- live ink stays flat and uniform no matter how dense the pen points get.
+function StylusAnnotations:drawLiveSegment(x1, y1, x2, y2, sw, color)
+    local bb = Screen.bb
+    local half = math.floor(sw / 2)
+    local function stamp(sx, sy)
+        bb:paintRectRGB32(
+            math.floor(sx) - half, math.floor(sy) - half, sw, sw, color)
+    end
+    stamp(x1, y1)
+    local dx, dy = x2 - x1, y2 - y1
+    local dist_sq = dx * dx + dy * dy
+    if dist_sq >= 1 then
+        local steps = math.ceil(math.sqrt(dist_sq))
+        for s = 1, steps do
+            stamp(x1 + dx * (s / steps), y1 + dy * (s / steps))
+        end
+    else
+        stamp(x2, y2)
+    end
 end
 
 function StylusAnnotations:getPageZoom(page)
@@ -1040,7 +1116,6 @@ function StylusAnnotations:deleteStroke(stroke)
     if self.selected_stroke == stroke then
         self.selected_stroke = nil
     end
-    local page = stroke.page
     for i, s in ipairs(self.strokes) do
         if s == stroke then
             table.remove(self.strokes, i)
@@ -1048,7 +1123,6 @@ function StylusAnnotations:deleteStroke(stroke)
         end
     end
     self:rebuildPageIndex()
-    self:maybeRemoveBookmark(page)
     self:scheduleSave()
     UIManager:setDirty(self.view, "partial")
 end
@@ -1059,35 +1133,6 @@ function StylusAnnotations:rebuildPageIndex()
         self.strokes_by_page[stroke.page] = self.strokes_by_page[stroke.page] or {}
         table.insert(self.strokes_by_page[stroke.page], i)
     end
-end
-
---------------------------------------------------------------------------------
--- Bookmarks (page markers for navigability)
---------------------------------------------------------------------------------
-
-function StylusAnnotations:ensureBookmark(page)
-    if not self.ui.paging then return end
-    if not self.ui.annotation or not self.ui.bookmark then return end
-    if self.bookmarked_pages[page] then return end
-    if self.ui.bookmark:getDogearBookmarkIndex(page) then
-        self.bookmarked_pages[page] = true
-        return
-    end
-    local item = { page = page }
-    local index = self.ui.annotation:addItem(item)
-    self.ui:handleEvent(Event:new("AnnotationsModified", { item, index_modified = index }))
-    self.bookmarked_pages[page] = true
-end
-
-function StylusAnnotations:maybeRemoveBookmark(page)
-    if not self.ui.annotation or not self.bookmarked_pages[page] then return end
-    if #(self.strokes_by_page[page] or {}) > 0 then return end
-    local index = self.ui.bookmark and self.ui.bookmark:getDogearBookmarkIndex(page)
-    if index then
-        local item = table.remove(self.ui.annotation.annotations, index)
-        self.ui:handleEvent(Event:new("AnnotationsModified", { item, index_modified = -index }))
-    end
-    self.bookmarked_pages[page] = nil
 end
 
 --------------------------------------------------------------------------------
@@ -1142,7 +1187,6 @@ function StylusAnnotations:loadStrokes()
     local filepath = self:getStrokesFilePath()
     self.strokes = {}
     self.strokes_by_page = {}
-    self.bookmarked_pages = {}
     self.strokes_loaded = true
     if not filepath then return end
     local f = io.open(filepath, "r")
@@ -1173,7 +1217,7 @@ end
 function StylusAnnotations:addToMainMenu(menu_items)
     menu_items.stylus_annotations = {
         text = _("Stylus annotations"),
-        sorting_hint = "tools",
+        sorting_hint = "typeset",
         sub_item_table = {
             {
                 text = _("Enable drawing"),
@@ -1215,7 +1259,13 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Delete all strokes"),
+                text = _("Delete all strokes on the current page"),
+                callback = function()
+                    self:deleteAllStrokesOnPage()
+                end,
+            },
+            {
+                text = _("Delete all strokes in the document"),
                 callback = function()
                     self:deleteAllStrokes()
                 end,
@@ -1241,20 +1291,46 @@ function StylusAnnotations:getWidthMenuItems()
     return items
 end
 
-function StylusAnnotations:deleteAllStrokes()
-    local pages = {}
-    for page, _ in pairs(self.strokes_by_page) do
-        pages[#pages + 1] = page
+function StylusAnnotations:deleteAllStrokesOnPage()
+    local pages = self:getVisiblePages()
+    if not pages then return end
+    local count = 0
+    for _, page in ipairs(pages) do
+        count = count + #(self.strokes_by_page[page] or {})
     end
+    if count == 0 then return end
+    UIManager:show(ConfirmBox:new{
+        text = _("Delete all stylus annotations on this page?"),
+        ok_text = _("Delete"),
+        ok_callback = function()
+            local keep = {}
+            for i, stroke in ipairs(self.strokes) do
+                local remove = false
+                for _, page in ipairs(pages) do
+                    if stroke.page == page then
+                        remove = true
+                        break
+                    end
+                end
+                if not remove then
+                    keep[#keep + 1] = stroke
+                end
+            end
+            self.strokes = keep
+            self:rebuildPageIndex()
+            self:scheduleSave()
+            UIManager:setDirty(self.view, "partial")
+        end,
+    })
+end
+
+function StylusAnnotations:deleteAllStrokes()
     UIManager:show(ConfirmBox:new{
         text = _("Delete all stylus annotations for this document?"),
         ok_text = _("Delete"),
         ok_callback = function()
             self.strokes = {}
             self:rebuildPageIndex()
-            for _, page in ipairs(pages) do
-                self:maybeRemoveBookmark(page)
-            end
             self:scheduleSave()
             UIManager:setDirty(self.view, "partial")
         end,
@@ -1273,6 +1349,10 @@ function StylusAnnotations:onCloseDocument()
     if self.hold_timer then
         UIManager:unschedule(self.hold_timer)
         self.hold_timer = nil
+    end
+    if self.refresh_timer then
+        UIManager:unschedule(self.refresh_timer)
+        self.refresh_timer = nil
     end
     self.current_stroke = nil
     self:teardownStylusCallback()
