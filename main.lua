@@ -572,12 +572,9 @@ function StylusAnnotations:getStrokeScreenWidth(stroke)
     return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
 end
 
--- Resolve a palette color exactly the way ReaderHighlight does for text
--- highlights, so the annotation color (and its menu swatch) is identical to the
--- highlight color. black/white come from EXTRA_COLORS and aren't in the
--- highlight palette, so keep those as concrete COLOR_HEX values; everything
--- else goes through the highlight's getHighlightColor (which, notably, renders
--- "gray" as a light gray based on the highlight lighten factor, not a mid-gray).
+-- Resolve a palette color the same way ReaderHighlight does for text highlights.
+-- black/white come from EXTRA_COLORS and aren't in the highlight palette, so use
+-- their concrete COLOR_HEX; everything else goes through getHighlightColor.
 function StylusAnnotations:getPaletteColor(name)
     if name == "black" or name == "white" then
         local hex = COLOR_HEX[name]
@@ -689,10 +686,7 @@ function StylusAnnotations:getStrokeScreenBox(stroke)
     return x0, y0, x1, y1
 end
 
--- Render a stroke as a connected thick polyline: march an overlapping stamp along
--- every segment between consecutive points. With the digitizer's full sample rate
--- now reaching koreader (~380Hz, via the input_android history-unroll), the points
--- land ~1-2px apart, so line segments read as a continuous smooth stroke.
+-- Render a stroke as a connected thick polyline along its screen points.
 function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
     local n = #sph
     if n == 0 then return end
@@ -701,8 +695,6 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
         mask:paintRectRGB32(
             math.floor(sx) - half, math.floor(sy) - half, sw, sw, color)
     end
-    -- Compute the stroke's screen bounding box (padded by the stamp radius) so
-    -- we only touch the region that the stroke actually covers.
     local min_x, min_y, max_x, max_y
     for i = 1, n do
         local px, py = sph[i].x, sph[i].y
@@ -720,12 +712,8 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
     box_h = math.min(bb:getHeight() - box_y, box_h)
     if box_w <= 0 or box_h <= 0 then return end
 
-    -- Plan a single multiply pass over the box (matching how text highlights
-    -- apply their color). We must NOT multiplyRect the stamps individually, or
-    -- overlapping stamps compound and darken the stroke far past the chosen
-    -- color. Instead, paint the stroke shape once into an all-white scratch
-    -- buffer (paintRectRGB overwrites, so overlaps never accumulate), then
-    -- multiply the affected area of the real buffer by it in one pass.
+    -- Paint the stroke once into an all-white scratch mask, then multiply it
+    -- into the buffer in a single pass (no compounding from overlapping stamps).
     local mask = Blitbuffer.new(box_w, box_h, bb:getType())
     if not mask then return end
     mask:paintRect(0, 0, box_w, box_h, Blitbuffer.COLOR_WHITE)
@@ -751,14 +739,9 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
         end
     end
 
-    -- Apply the whole stroke as one multiply over the paper. blitFrom with a
-    -- setPixelMultiply setter multiplies each destination pixel once by the
-    -- mask pixel (white = x1; the painted color multiplies where the stroke
-    -- is), so the selected color blends with the content in a single pass,
-    -- exactly like a text highlight -- no compounding.
+    -- Multiply the mask into the buffer in one pass; on an inverted buffer
+    -- multiply can't work, so OVER-blend the pre-inverted color instead.
     if bb:getInverse() == 1 then
-        -- multiply can't work on an inverted buffer; fall back to OVER-blend of
-        -- the pre-inverted color, mirroring the highlight drawer.
         local rb = color:getColorRGB32()
         local inv = Blitbuffer.ColorRGB32(rb.r, rb.g, rb.b, 0xFF):invert()
         bb:blendRectRGB32(box_x, box_y, box_w, box_h, inv)
