@@ -512,10 +512,10 @@ function StylusAnnotations:addStrokePoint(x, y)
     -- region. endStroke() redraws/refreshes nothing extra in this mode: the
     -- fast refresh on pen-up just reveals what was already painted live.
     --
-    -- NOTE: This draws each segment by direct paint (an unvarying color), NOT
-    -- by the multiply used in the stable path. Multiply compounds where stamps
-    -- overlap, so slow, dense pen strokes show darker dots; direct paint keeps
-    -- the ink flat and uniform no matter how dense the points get.
+    -- NOTE: Like the stable path, each live segment is multiplied into the
+    -- buffer (highlight mechanism) so the page content shows through the ink.
+    -- The pen-up full refresh repaints the finished stroke over a fresh page,
+    -- which also clears any overlap darkening accumulated while drawing.
     if self.live_ink ~= false then
         local swz = self:getPageZoom(stroke.page) * stroke.width
         self:drawLiveSegment(
@@ -884,28 +884,17 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color)
     mask:free()
 end
 
--- Draw a single live segment directly into the framebuffer. Unlike drawStrokePath
--- (which multiplies a pre-stamped mask so overlapping stamps compound darker at
--- dense points), this paints each stamp with the unvarying render color, so the
--- live ink stays flat and uniform no matter how dense the pen points get.
+-- Draw a single live segment using the same highlight mechanism as the stable
+-- path: stamp the segment into a white mask, then multiply it into the buffer
+-- (or over-blend the pre-inverted color on an inverted buffer). A direct opaque
+-- paint would block the page content; this lets it show through the highlight
+-- color, matching the finished stroke.
 function StylusAnnotations:drawLiveSegment(x1, y1, x2, y2, sw, color)
     local bb = Screen.bb
-    local half = math.floor(sw / 2)
-    local function stamp(sx, sy)
-        bb:paintRectRGB32(
-            math.floor(sx) - half, math.floor(sy) - half, sw, sw, color)
-    end
-    stamp(x1, y1)
-    local dx, dy = x2 - x1, y2 - y1
-    local dist_sq = dx * dx + dy * dy
-    if dist_sq >= 1 then
-        local steps = math.ceil(math.sqrt(dist_sq))
-        for s = 1, steps do
-            stamp(x1 + dx * (s / steps), y1 + dy * (s / steps))
-        end
-    else
-        stamp(x2, y2)
-    end
+    self:drawStrokePath(bb, {
+        { x = x1, y = y1 },
+        { x = x2, y = y2 },
+    }, sw, color)
 end
 
 function StylusAnnotations:getPageZoom(page)
@@ -1386,7 +1375,7 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Delete all strokes on the current page"),
+                text = _("Delete strokes on the current page"),
                 callback = function()
                     self:deleteAllStrokesOnPage()
                 end,
