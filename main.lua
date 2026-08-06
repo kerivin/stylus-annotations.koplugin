@@ -23,7 +23,6 @@ local Blitbuffer = require("ffi/blitbuffer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
-local Event = require("ui/event")
 local Geometry = require("lib/geometry")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
@@ -97,7 +96,6 @@ local StylusAnnotations = InputContainer:extend{
 
     strokes = nil,
     strokes_by_page = nil,     -- page -> array of indices into self.strokes
-    strokes_loaded = false,
 
     stylus_callback_registered = false,
     touch_zones_registered = false,
@@ -333,13 +331,6 @@ function StylusAnnotations:onStylusEvent(input, slot)
     return true
 end
 
-function StylusAnnotations:clearHoldTimer()
-    if self.hold_timer then
-        UIManager:unschedule(self.hold_timer)
-        self.hold_timer = nil
-    end
-end
-
 --------------------------------------------------------------------------------
 -- Live drawing
 --------------------------------------------------------------------------------
@@ -502,33 +493,27 @@ function StylusAnnotations:endStroke()
     if self.live_ink == false then
         self:renderStrokeToScreen(stroke)
     end
-    -- Commit the crisp stroke with a partial refresh. When live ink is on, the
-    -- stroke is shown progressively via fast (A2) refreshes; those leave ghost
-    -- trails that a partial on pen-up can clear. To make sure the refresh lands
-    -- even if the pen-up arrives in the middle of a fast-refresh burst, defer
-    -- it slightly and refresh again once the user has stopped drawing.
+    -- Commit the stroke with a partial refresh, and when live ink is on also
+    -- schedule a full-screen refresh shortly after the pen lifts. The fast (A2)
+    -- commits used while drawing leave residue that a plain partial can't fully
+    -- clear on this panel; the deferred full wave lands once drawing has stopped.
     self:refreshRegion(region)
     if self.live_ink ~= false then
-        self:scheduleRefresh(region)
+        self:scheduleRefresh()
     end
 end
 
--- Deferred refresh: re-crisp the last stroke once drawing has stopped.
--- Scheduled on pen-up and re-armed on any further stroke activity, so a burst
--- of strokes still ends with a final clean refresh.
--- NOTE: A plain region "partial" (GU16) does NOT purge the A2/fast residue the
--- live stroking left behind on this panel. A stronger full-screen wave is
--- required to clear the trails, so this timer queues a full-viewport refresh and
--- scrubs the framebuffer's dirty bitmap manually.
-function StylusAnnotations:scheduleRefresh(region)
+-- Deferred full refresh: queued on pen-up and re-armed on any further stroke
+-- activity, so a burst of strokes still ends with a final clean refresh. The
+-- live stroking uses fast (A2) commits which leave residue that a region partial
+-- does NOT purge on this panel; only a stronger full-screen waveform clears it,
+-- exactly like a page turn.
+function StylusAnnotations:scheduleRefresh()
     if self.refresh_timer then
         UIManager:unschedule(self.refresh_timer)
     end
     local refresh_timer = function()
         self.refresh_timer = nil
-        -- The standard "partial" exception targeting a region won't clear A2
-        -- residue. Queue a full refresh: on e-ink that forces a clean waveform
-        -- across the whole viewport, exactly like a page turn does.
         UIManager:setDirty(self.view, "full")
     end
     self.refresh_timer = refresh_timer
@@ -570,31 +555,27 @@ function StylusAnnotations:renderStrokeToScreen(stroke)
         if not sx then break end
         sph[i] = { x = sx, y = sy }
     end
-    self:drawStrokePath(Screen.bb, sph, sw, color, stroke.alpha)
+    self:drawStrokePath(Screen.bb, sph, sw, color)
 end
 
 function StylusAnnotations:refreshRegion(region)
-    local function refresh(mode, r)
-        if r then
-            local rx = math.max(0, math.floor(r.x))
-            local ry = math.max(0, math.floor(r.y))
-            local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
-            local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            if rw > 0 and rh > 0 then
-                UIManager:setDirty(self.view, function()
-                    return mode, Geom:new{x = rx, y = ry, w = rw, h = rh}
-                end)
-                return
-            end
+    -- Commit the finished stroke with a crisp GU16 partial. With live ink on the
+    -- stroke was already painted by fast A2 commits while drawing; this partial
+    -- crisps it up. With live ink off nothing touched the panel until now, so the
+    -- partial reveals the freshly rendered stroke.
+    if region then
+        local rx = math.max(0, math.floor(region.x))
+        local ry = math.max(0, math.floor(region.y))
+        local rw = math.min(Screen:getWidth() - rx, math.ceil(region.w))
+        local rh = math.min(Screen:getHeight() - ry, math.ceil(region.h))
+        if rw > 0 and rh > 0 then
+            UIManager:setDirty(self.view, function()
+                return "partial", Geom:new{x = rx, y = ry, w = rw, h = rh}
+            end)
+            return
         end
-        UIManager:setDirty(self.view, mode)
     end
-
-    -- Deferred (live ink off): nothing touched the panel on pen-up, so a single
-    -- GU16 partial commits the finished stroke in its final grey.
-    -- Live (live ink on): the stroke was already painted by fast A2 commits
-    -- while drawing; a GU16 partial on pen-up crisps it up.
-    refresh("partial", region)
+    UIManager:setDirty(self.view, "partial")
 end
 
 -- Pen-down without drawing for HOLD_TIME_S opens the stroke menu on the
@@ -628,11 +609,7 @@ end
 -- Colors in EXTRA_COLORS aren't part of the highlight palette, so use their
 -- concrete COLOR_HEX; everything else goes through getHighlightColor.
 function StylusAnnotations:getPaletteColor(name)
-    if EXTRA_COLOR_NAMES[name] then
-        local hex = COLOR_HEX[name]
-        return hex and Blitbuffer.colorFromString(hex) or Blitbuffer.COLOR_BLACK
-    end
-    if self.ui.highlight then
+    if self.ui.highlight and not EXTRA_COLOR_NAMES[name] then
         return self.ui.highlight:getHighlightColor(name, nil, Screen.night_mode)
     end
     local hex = COLOR_HEX[name]
@@ -708,7 +685,6 @@ end
 
 function StylusAnnotations:paintStroke(bb, x, y, stroke)
     local color = self:getRenderColor(stroke)
-    local alpha = stroke.alpha
     local sw = self:getPageZoom(stroke.page) * stroke.width
     local pts = stroke.points
     local n = #pts
@@ -719,7 +695,7 @@ function StylusAnnotations:paintStroke(bb, x, y, stroke)
         if not sx then return end
         sph[i] = { x = x + sx, y = y + sy }
     end
-    self:drawStrokePath(bb, sph, sw, color, alpha)
+    self:drawStrokePath(bb, sph, sw, color)
 end
 
 function StylusAnnotations:getStrokeScreenBox(stroke)
@@ -739,7 +715,7 @@ function StylusAnnotations:getStrokeScreenBox(stroke)
 end
 
 -- Render a stroke as a connected thick polyline along its screen points.
-function StylusAnnotations:drawStrokePath(bb, sph, sw, color, alpha)
+function StylusAnnotations:drawStrokePath(bb, sph, sw, color)
     local n = #sph
     if n == 0 then return end
     local half = math.floor(sw / 2)
@@ -1042,42 +1018,39 @@ end
 -- Swatch color picker, mirroring ReaderHighlight:editHighlightColor
 -- (the same ButtonSelector the text highlights pop for "Color").
 function StylusAnnotations:chooseStrokeColor(stroke)
-    local color_selector
-    local bg_colors = {}
-    for i, c in ipairs(COLOR_PALETTE) do
-        bg_colors[i] = self:getPaletteColor(c[2])
-    end
-    color_selector = ButtonSelector:new{
-        current_value = stroke.color,
-        values = COLOR_PALETTE,
-        bg_colors = bg_colors,
-        callback = function(value)
-            self:setStrokeColor(stroke, value)
-            UIManager:close(color_selector)
-        end,
-    }
-    UIManager:show(color_selector)
+    self:showColorPicker(stroke.color, function(value)
+        self:setStrokeColor(stroke, value)
+    end)
 end
 
 -- Default pen color picker, same ButtonSelector (color swatches) as the text
 -- highlights pop for "Color", so the two menus look identical.
 function StylusAnnotations:choosePenColor()
-    local color_selector
+    self:showColorPicker(self.color, function(value)
+        self.color = value
+        self:saveSettings()
+    end)
+end
+
+-- Shared color swatch picker backed by COLOR_PALETTE; `apply` is called with
+-- the chosen color and must close the selector when it's done. The selector is
+-- shown asynchronously, so `apply` can't drive it directly -- we keep a ref and
+-- close from the callback.
+function StylusAnnotations:showColorPicker(current, apply)
     local bg_colors = {}
     for i, c in ipairs(COLOR_PALETTE) do
         bg_colors[i] = self:getPaletteColor(c[2])
     end
-    color_selector = ButtonSelector:new{
-        current_value = self.color,
+    local selector = ButtonSelector:new{
+        current_value = current,
         values = COLOR_PALETTE,
         bg_colors = bg_colors,
         callback = function(value)
-            self.color = value
-            self:saveSettings()
-            UIManager:close(color_selector)
+            apply(value)
+            UIManager:close(selector)
         end,
     }
-    UIManager:show(color_selector)
+    UIManager:show(selector)
 end
 
 function StylusAnnotations:chooseStrokeWidth(stroke)
@@ -1187,7 +1160,6 @@ function StylusAnnotations:loadStrokes()
     local filepath = self:getStrokesFilePath()
     self.strokes = {}
     self.strokes_by_page = {}
-    self.strokes_loaded = true
     if not filepath then return end
     local f = io.open(filepath, "r")
     if not f then return end
