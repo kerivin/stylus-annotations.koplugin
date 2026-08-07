@@ -39,7 +39,6 @@ local logger = require("logger")
 local dbg = require("dbg")
 local _ = require("gettext")
 local T = require("ffi/util").template
-local time = require("ui/time")
 
 local Screen = Device.screen
 
@@ -51,8 +50,6 @@ local SAVE_DELAY_MS = 800
 local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_DELAY_S = 0.7
-local PEN_DOUBLE_TAP_INTERVAL_MS = 350
-local PEN_DOUBLE_TAP_DISTANCE_PX = 60
 
 local DEFAULT_WIDTH = 2
 local DEFAULT_HIGHLIGHTER_WIDTH = 20
@@ -160,19 +157,9 @@ local StylusAnnotations = InputContainer:extend{
     hold_start_x = 0,
     hold_start_y = 0,
 
-    last_pen_lift = nil,         -- { time = fts, x, y } of last pen-up, for pen double-tap
-    last_tap_dot = nil,          -- stroke committed by the first tap of a double-tap
-    double_tap_latched = false,
-
-    last_tap = nil,              -- { time = fts, x, y } of last finger tap, for double-tap
-    pending_tap_cb = nil,        -- deferred single-tap action (cancelled by a double-tap)
-
     selected_stroke = nil,
-
     dirty_region = nil,
-
     refresh_timer = nil,
-
     pending_save = nil,
 }
 
@@ -205,7 +192,7 @@ function StylusAnnotations:init()
     -- frame, synchronous in the Input thread). With the stylus now delivering
     -- the full ~380Hz sample rate, keeping those per-frame logs on would
     -- throttle the drain again, so force debug logging off here.
-    dbg:turnOff()
+dbg:turnOff()
 
     logger.info("StylusAnnotations: initialized, strokes =", #self.strokes)
 end
@@ -363,8 +350,7 @@ function StylusAnnotations:onStylusEvent(input, slot)
     -- A widget (menu, dialog, ...) is on top: let the stylus drive the UI.
     if self:isOverlayActive() then return false end
 
-    -- Drawing disabled: pass through so pen gestures (hold/double-tap
-    -- stroke editing) keep working.
+    -- Drawing disabled: pass through so pen input can drive the UI normally.
     if not self:isEnabled() then return false end
 
     local tool = slot.tool or TOOL_TYPE_PEN
@@ -372,67 +358,23 @@ function StylusAnnotations:onStylusEvent(input, slot)
 
     local x, y = slot.x or 0, slot.y or 0
     if slot.id and slot.id >= 0 then
-        -- Contact active (down or move).
+        -- Contact active (down or move). Every pen-down starts a stroke;
+        -- strokes are deleted from the stroke menu only.
         if self.current_stroke then
             self:addStrokePoint(x, y)
-        elseif self:detectPenDoubleTap(x, y) then
-            -- A double-tap on a stroke: delete it instead of starting a new
-            -- stroke (which, as a barely-a-point, would just add a dot).
-            self:onDoubleTap(x, y)
         else
             self:startStroke(x, y, tool)
         end
         self.pen_x, self.pen_y = x, y
     else
         -- Contact lifted: end the stroke. A single point yields a small dot.
-        local ended = self.current_stroke
-        if ended then
+        if self.current_stroke then
             self:endStroke()
-            if #ended.points <= 1 then
-                -- A tap (single point): remember it so a following double-tap can
-                -- drop this stillborn dot before hit-testing the stroke below it.
-                self.last_tap_dot = ended
-            end
-        else
-            self.last_tap_dot = nil
         end
-        self.last_pen_lift = { time = time.monotonic(), x = x, y = y }
     end
 
     -- Dominate: keep this pen event away from gesture detection.
     return true
-end
-
--- A pen-down that immediately follows a recent pen-up nearby is a double-tap
--- (drawing keeps the pen away from the global gesture detector, so we must
--- recognize it ourselves). Only once: the next pen-down clears the latch.
-function StylusAnnotations:detectPenDoubleTap(x, y)
-    local last = self.last_pen_lift
-    self.last_pen_lift = nil
-    if not last then return false end
-    if self.double_tap_latched then
-        self.double_tap_latched = false
-        return false
-    end
-    local dt_ms = time.to_ms(time.monotonic() - last.time)
-    if dt_ms > PEN_DOUBLE_TAP_INTERVAL_MS then return false end
-    if math.abs(x - last.x) > PEN_DOUBLE_TAP_DISTANCE_PX
-        or math.abs(y - last.y) > PEN_DOUBLE_TAP_DISTANCE_PX then return false end
-    self.double_tap_latched = true
-    return true
-end
-
-function StylusAnnotations:onDoubleTap(x, y)
-    -- The first tap of the double-tap committed a stillborn dot at this spot;
-    -- drop it so the hit-test finds the real stroke underneath it.
-    if self.last_tap_dot then
-        self:deleteStroke(self.last_tap_dot)
-        self.last_tap_dot = nil
-    end
-    local stroke = self:findStrokeAt({ pos = { x = x, y = y } })
-    if stroke then
-        self:deleteStroke(stroke)
-    end
 end
 
 --------------------------------------------------------------------------------
@@ -976,83 +918,21 @@ function StylusAnnotations:setupTouchZones()
                 return self:onStrokeTap(ges)
             end,
         },
-        -- Fires when the user has NOT disabled the native double_tap gesture
-        -- (Input.disable_double_tap = false): the detector emits a `double_tap`
-        -- gesture and defers `tap`, so we need this zone to catch the delete.
-        {
-            id = "stylus_annotations_double_tap",
-            ges = "double_tap",
-            screen_zone = {
-                ratio_x = 0, ratio_y = 0,
-                ratio_w = 1, ratio_h = 1,
-            },
-            overrides = {
-                "stylus_annotations_tap",
-            },
-            handler = function(ges)
-                return self:onStrokeDoubleTap(ges)
-            end,
-        },
     })
     self.touch_zones_registered = true
 end
 
--- The device's global double_tap gesture is disabled by default
--- (Input.disable_double_tap = true), so the double_tap touch zone never fires.
--- Here we detect a double tap from two consecutive quick `tap` gestures, and
--- only fire the single-tap action after a short deferral so a quick second tap
--- can supersede it (mirroring the disabled native double-tap window).
+-- A single tap on a stroke opens the stroke menu right away. There is no
+-- double-tap handling anymore (delete, native-suppress, etc.).
 function StylusAnnotations:onStrokeTap(ges)
     if self:isOverlayActive() then return false end
-    local now = time.monotonic()
-    local on_stroke = self:findStrokeAt(ges) ~= nil
-    if not on_stroke then
+    local stroke = self:findStrokeAt(ges)
+    if not stroke then
         -- Normal reading gesture on empty space: let the reader handle it.
-        self:clearPendingSingleTap()
-        self.last_tap = nil
         return false
     end
-    if self.last_tap and
-       now - self.last_tap.time <= time.ms(PEN_DOUBLE_TAP_INTERVAL_MS) and
-       math.abs(ges.pos.x - self.last_tap.x) <= PEN_DOUBLE_TAP_DISTANCE_PX and
-       math.abs(ges.pos.y - self.last_tap.y) <= PEN_DOUBLE_TAP_DISTANCE_PX then
-        self:clearPendingSingleTap()
-        self.last_tap = nil
-        return self:onStrokeDoubleTap(ges)
-    end
-    -- Not (yet) a double tap: ask for a single-tap; defer actually showing the
-    -- stroke menu so a quick second tap can turn this into a delete.
-    self.last_tap = { time = now, x = ges.pos.x, y = ges.pos.y }
-    if self.pending_tap_cb then UIManager:unschedule(self.pending_tap_cb) end
-    self.pending_tap_cb = function()
-        self.pending_tap_cb = nil
-        self.last_tap = nil
-        self:onStrokeTapSingle(ges)
-    end
-    UIManager:scheduleIn(time.ms(PEN_DOUBLE_TAP_INTERVAL_MS), self.pending_tap_cb)
-    return true
-end
-
-function StylusAnnotations:clearPendingSingleTap()
-    if self.pending_tap_cb then
-        UIManager:unschedule(self.pending_tap_cb)
-        self.pending_tap_cb = nil
-    end
-end
-
-function StylusAnnotations:onStrokeTapSingle(ges)
-    local stroke = self:findStrokeAt(ges)
-    if not stroke then return false end
     self:setSelection(stroke)
     self:showStrokeMenu(stroke)
-    return true
-end
-
-function StylusAnnotations:onStrokeDoubleTap(ges)
-    if self:isOverlayActive() then return false end
-    local stroke = self:findStrokeAt(ges)
-    if not stroke then return false end
-    self:deleteStroke(stroke)
     return true
 end
 
@@ -1122,7 +1002,7 @@ function StylusAnnotations:showStrokeMenu(stroke)
                     callback = function()
                         self:clearSelection()
                         UIManager:close(dialog)
-                        self:deleteStroke(stroke)
+                        self:deleteStroke(stroke, false)
                     end,
                 },
                 {
@@ -1169,14 +1049,16 @@ end
 -- shown asynchronously, so `apply` can't drive it directly -- we keep a ref and
 -- close from the callback.
 function StylusAnnotations:showColorPicker(current, apply)
-    local bg_colors = {}
+    -- ButtonSelector expects { text, key, color } entries and renders the
+    -- swatch from the Blitbuffer color (like ReaderHighlight's text-highlight
+    -- picker); feeding it the palette keys alone yields a text-only menu.
+    local values = {}
     for i, c in ipairs(COLOR_PALETTE) do
-        bg_colors[i] = self:getPaletteColor(c[2])
+        values[i] = { c[1], c[2], self:getPaletteColor(c[2]) }
     end
     local selector = ButtonSelector:new{
         current_value = current,
-        values = COLOR_PALETTE,
-        bg_colors = bg_colors,
+        values = values,
         callback = function(value)
             apply(value)
             UIManager:close(selector)
@@ -1217,7 +1099,7 @@ function StylusAnnotations:afterStrokeModified(stroke)
     UIManager:setDirty(self.view, "partial")
 end
 
-function StylusAnnotations:deleteStroke(stroke)
+function StylusAnnotations:deleteStroke(stroke, notify)
     if self.selected_stroke == stroke then
         self.selected_stroke = nil
     end
@@ -1230,6 +1112,24 @@ function StylusAnnotations:deleteStroke(stroke)
     self:rebuildPageIndex()
     self:scheduleSave()
     UIManager:setDirty(self.view, "partial")
+    if notify ~= false then
+        self:notifyStrokeDeleted(1)
+    end
+end
+
+-- Non-blocking "X stroke(s) deleted" feedback: it confirms what was removed
+-- without asking for anything (matches InfoMessage, no ConfirmBox).
+function StylusAnnotations:notifyStrokeDeleted(count)
+    local text
+    if count == 1 then
+        text = _("1 stroke deleted")
+    else
+        text = T(_("%1 strokes deleted"), count)
+    end
+    UIManager:show(InfoMessage:new{
+        text = text,
+        timeout = 2,
+    })
 end
 
 function StylusAnnotations:rebuildPageIndex()
@@ -1493,10 +1393,11 @@ function StylusAnnotations:deleteAllStrokesOnPage()
     end
     if count == 0 then return end
     UIManager:show(ConfirmBox:new{
-        text = _("Delete all stylus annotations on this page?"),
+        text = T(_("Delete all %1 strokes on this page?"), count),
         ok_text = _("Delete"),
         ok_callback = function()
             local keep = {}
+            local removed = 0
             for i, stroke in ipairs(self.strokes) do
                 local remove = false
                 for _, page in ipairs(pages) do
@@ -1505,7 +1406,9 @@ function StylusAnnotations:deleteAllStrokesOnPage()
                         break
                     end
                 end
-                if not remove then
+                if remove then
+                    removed = removed + 1
+                else
                     keep[#keep + 1] = stroke
                 end
             end
@@ -1513,19 +1416,22 @@ function StylusAnnotations:deleteAllStrokesOnPage()
             self:rebuildPageIndex()
             self:scheduleSave()
             UIManager:setDirty(self.view, "partial")
+            self:notifyStrokeDeleted(removed)
         end,
     })
 end
 
 function StylusAnnotations:deleteAllStrokes()
+    local total = #self.strokes
     UIManager:show(ConfirmBox:new{
-        text = _("Delete all stylus annotations for this document?"),
+        text = T(_("Delete all %1 strokes for this document?"), total),
         ok_text = _("Delete"),
         ok_callback = function()
             self.strokes = {}
             self:rebuildPageIndex()
             self:scheduleSave()
             UIManager:setDirty(self.view, "partial")
+            self:notifyStrokeDeleted(total)
         end,
     })
 end
