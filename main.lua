@@ -24,7 +24,6 @@ local Screen = Device.screen
 local SELECTION_WHITE = Blitbuffer.ColorRGB32(0xFF, 0xFF, 0xFF, 0xFF)
 
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
-local TOOL_TYPE_HIGHLIGHTER = Device.input.TOOL_TYPE_HIGHLIGHTER
 
 local HIT_TEST_THRESHOLD_PX = 25
 local SAVE_DELAY_MS = 800
@@ -33,7 +32,6 @@ local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_DELAY_S = 0.7
 
 local DEFAULT_WIDTH = 2
-local DEFAULT_HIGHLIGHTER_WIDTH = 20
 local DEFAULT_COLOR = "orange"
 
 local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
@@ -173,8 +171,6 @@ function StylusAnnotations:loadSettings()
     local ds = self.ui.doc_settings
     self.live_ink = ds:readSetting("stylus_annotations_live_ink") == true
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
-    self.highlighter_width = ds:readSetting("stylus_annotations_highlighter_width")
-        or DEFAULT_HIGHLIGHTER_WIDTH
     self.color = ds:readSetting("stylus_annotations_color") or DEFAULT_COLOR
 end
 
@@ -182,7 +178,6 @@ function StylusAnnotations:saveSettings()
     local ds = self.ui.doc_settings
     ds:saveSetting("stylus_annotations_live_ink", self.live_ink ~= false)
     ds:saveSetting("stylus_annotations_width", self.width)
-    ds:saveSetting("stylus_annotations_highlighter_width", self.highlighter_width)
     ds:saveSetting("stylus_annotations_color", self.color)
 end
 
@@ -291,8 +286,7 @@ function StylusAnnotations:onStylusEvent(input, slot)
 
     if not self:isEnabled() then return false end
 
-    local tool = slot.tool or TOOL_TYPE_PEN
-    if tool ~= TOOL_TYPE_PEN and tool ~= TOOL_TYPE_HIGHLIGHTER then return false end
+    if (slot.tool or TOOL_TYPE_PEN) ~= TOOL_TYPE_PEN then return false end
 
     local x, y = slot.x or 0, slot.y or 0
     if slot.id and slot.id >= 0 then
@@ -300,7 +294,7 @@ function StylusAnnotations:onStylusEvent(input, slot)
         if self.current_stroke then
             self:addStrokePoint(x, y)
         else
-            self:startStroke(x, y, tool)
+            self:startStroke(x, y)
         end
         self.pen_x, self.pen_y = x, y
     else
@@ -313,17 +307,16 @@ function StylusAnnotations:onStylusEvent(input, slot)
     return true
 end
 
-function StylusAnnotations:startStroke(x, y, tool)
+function StylusAnnotations:startStroke(x, y)
     local pos = self.ui.view:screenToPageTransform({ x = x, y = y })
     self.stroke_id_counter = self.stroke_id_counter + 1
     self.current_stroke = {
         id = tostring(self.stroke_id_counter),
         page = pos.page,
-        tool = tool == TOOL_TYPE_HIGHLIGHTER and "highlighter" or "pen",
         points = { { x = pos.x, y = pos.y } },
-        width = tool == TOOL_TYPE_HIGHLIGHTER and self.highlighter_width or self.width,
+        width = self.width,
         color = self.color,
-        alpha = tool == TOOL_TYPE_HIGHLIGHTER and 0.5 or 1.0,
+        alpha = 1.0,
         zoom = pos.zoom or 1,
         datetime = os.time(),
     }
@@ -1053,20 +1046,12 @@ function StylusAnnotations:showColorPicker(current, apply)
 end
 
 function StylusAnnotations:chooseStrokeWidth(strokes)
-    local width_selector
-    local width_choices = {}
-    for _, w in ipairs(WIDTH_CHOICES) do
-        width_choices[#width_choices + 1] = { tostring(w), w }
-    end
-    width_selector = ButtonSelector:new{
-        current_value = strokes[1].width,
-        values = width_choices,
-        callback = function(value)
+    self:showWidthPicker{
+        start = strokes[1].width,
+        on_apply = function(value)
             self:setStrokeWidth(strokes, value)
-            UIManager:close(width_selector)
         end,
     }
-    UIManager:show(width_selector)
 end
 
 function StylusAnnotations:setStrokeColor(strokes, color)
@@ -1263,11 +1248,20 @@ function StylusAnnotations:addToMainMenu(menu_items)
     }
 end
 
-function StylusAnnotations:choosePenWidth(in_value)
+function StylusAnnotations:choosePenWidth()
+    self:showWidthPicker{
+        start = self.width,
+        on_apply = function(value)
+            self.width = value
+            self:saveSettings()
+        end,
+    }
+end
 
-    local pages = self:getVisiblePages()
-    local zoom = self:getPageZoom(pages and pages[1] or nil)
-    local start = in_value or self.width
+function StylusAnnotations:showWidthPicker(opts)
+    local zoom = self:getPageZoom((self:getVisiblePages() or {})[1])
+    local start = opts.start or self.width
+    local on_apply = opts.on_apply
 
     local index, use_presets = nil, false
     for i, w in ipairs(WIDTH_CHOICES) do
@@ -1286,9 +1280,7 @@ function StylusAnnotations:choosePenWidth(in_value)
         value_step = 1,
         value_hold_step = 2,
         precision = "%d",
-
         ok_always_enabled = true,
-
         extra_text = _("Custom..."),
         extra_callback = function()
 
@@ -1314,8 +1306,10 @@ function StylusAnnotations:choosePenWidth(in_value)
                                 if v and v >= 1 and v <= 30 then
                                     v = math.floor(v + 0.5)
                                     UIManager:close(input_dialog)
-
-                                    self:choosePenWidth(v)
+                                    self:showWidthPicker{
+                                        start = v,
+                                        on_apply = on_apply,
+                                    }
                                 else
                                     UIManager:show(InfoMessage:new{
                                         text = _("Invalid width (1 - 30)"),
@@ -1330,8 +1324,7 @@ function StylusAnnotations:choosePenWidth(in_value)
             UIManager:show(input_dialog)
         end,
         callback = function()
-            self.width = spin.value_widget:getValue()
-            self:saveSettings()
+            on_apply(spin.value_widget:getValue())
         end,
     }
 
@@ -1341,7 +1334,7 @@ function StylusAnnotations:choosePenWidth(in_value)
         dimen = Geom:new{ w = avail_w, h = ph },
         get_zoom = function() return zoom end,
         get_width = function()
-            return spin.value_widget and spin.value_widget:getValue() or self.width
+            return spin.value_widget and spin.value_widget:getValue() or start
         end,
     })
     UIManager:show(spin)
