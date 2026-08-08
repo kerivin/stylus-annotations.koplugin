@@ -51,4 +51,33 @@ function Geometry.isPointNearStroke(px, py, stroke, threshold)
     return Geometry.strokeDistanceSq(px, py, stroke) <= threshold * threshold
 end
 
+--- Axis-aligned bounding box of a stroke's points (native page space).
+-- @param stroke table with a points array of { x =, y = } entries
+-- @return x0, y0, x1, y1 (inclusive bounds) or nil if the stroke has no points
+function Geometry.strokeBBox(stroke)
+    local pts = stroke and stroke.points
+    if not pts or #pts == 0 then
+        return nil
+    end
+    local x0, y0 = pts[1].x, pts[1].y
+    local x1, y1 = x0, y0
+    for i = 2, #pts do
+        local p = pts[i]
+        if p.x < x0 then x0 = p.x end
+        if p.x > x1 then x1 = p.x end
+        if p.y < y0 then y0 = p.y end
+        if p.y > y1 then y1 = p.y end
+    end
+    return x0, y0, x1, y1
+end
+
+--- True if two strokes' bounding boxes intersect (positive overlap area,
+-- touching edges/corners don't count).
+function Geometry.strokesIntersect(a, b)
+    local ax0, ay0, ax1, ay1 = Geometry.strokeBBox(a)
+    local bx0, by0, bx1, by1 = Geometry.strokeBBox(b)
+    if not ax0 or not bx0 then return false end
+    return ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
+end
+
 return Geometry

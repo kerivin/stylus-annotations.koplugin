@@ -157,7 +157,7 @@ local StylusAnnotations = InputContainer:extend{
     hold_start_x = 0,
     hold_start_y = 0,
 
-    selected_stroke = nil,
+    selected_strokes = {},
     dirty_region = nil,
     refresh_timer = nil,
     pending_save = nil,
@@ -653,7 +653,7 @@ end
 function StylusAnnotations:showStrokeMenuAt(x, y)
     local stroke = self:findStrokeAt({ pos = { x = x, y = y } })
     if not stroke then return end
-    self:showStrokeMenu(stroke)
+    self:showStrokeMenu({ stroke })
 end
 
 function StylusAnnotations:getStrokeScreenWidth(stroke)
@@ -711,6 +711,26 @@ function StylusAnnotations:paintTo(bb, x, y)
     if not self.ui.paging then return end
     local pages = self:getVisiblePages()
     if not pages then return end
+    local st = self.view.state
+    logger.warn("DBG visible pages: " .. table.concat(pages, ","))
+    if st then
+        logger.warn(("DBG state page=%s offset=(%s,%s) zoom=%s visible_area=(%s,%s,%s,%s)"):format(
+            tostring(st.page), tostring(st.offset.x), tostring(st.offset.y), tostring(st.zoom),
+            tostring(self.view.visible_area and self.view.visible_area.x),
+            tostring(self.view.visible_area and self.view.visible_area.y),
+            tostring(self.view.visible_area and self.view.visible_area.w),
+            tostring(self.view.visible_area and self.view.visible_area.h)))
+    end
+    for _, page in ipairs(pages) do
+        for _, idx in ipairs(self.strokes_by_page[page] or {}) do
+            local s = self.strokes[idx]
+            local x0, y0, x1, y1 = self:getStrokeScreenBox(s)
+            if x0 then
+                logger.warn(("DBG stroke idx=%d page=%s screen=(%.1f,%.1f)-(%.1f,%.1f)"):format(
+                    idx, tostring(s.page), x0, y0, x1, y1))
+            end
+        end
+    end
     for _, page in ipairs(pages) do
         for _, idx in ipairs(self.strokes_by_page[page] or {}) do
             self:paintStroke(bb, x, y, self.strokes[idx])
@@ -720,9 +740,9 @@ function StylusAnnotations:paintTo(bb, x, y)
         self:paintStroke(bb, x, y, self.current_stroke)
     end
     -- Draw the selection last so a repaint (e.g. the finger-tap path) redraws
-    -- the box instead of wiping it.
-    if self.selected_stroke then
-        local rx, ry, rw, rh = self:getSelectionRect(self.selected_stroke, bb:getWidth(), bb:getHeight())
+    -- the boxes instead of wiping them.
+    for _, stroke in ipairs(self.selected_strokes) do
+        local rx, ry, rw, rh = self:getSelectionRect(stroke, bb:getWidth(), bb:getHeight())
         if rx then
             bb:invertRect(rx, ry, rw, rh)
         end
@@ -918,6 +938,24 @@ function StylusAnnotations:setupTouchZones()
                 return self:onStrokeTap(ges)
             end,
         },
+        -- A long finger hold (timing comes from KOReader's "Gestures intervals"
+        -- -> "Hold interval", ges_hold_interval) selects not just the stroke
+        -- under the finger but every stroke whose bounding box intersects it.
+        {
+            id = "stylus_annotations_hold",
+            ges = "hold",
+            screen_zone = {
+                ratio_x = 0, ratio_y = 0,
+                ratio_w = 1, ratio_h = 1,
+            },
+            overrides = {
+                "readerhighlight_hold",
+                "readerfooter_hold",
+            },
+            handler = function(ges)
+                return self:onStrokeHold(ges)
+            end,
+        },
     })
     self.touch_zones_registered = true
 end
@@ -925,15 +963,56 @@ end
 -- A single tap on a stroke opens the stroke menu right away. There is no
 -- double-tap handling anymore (delete, native-suppress, etc.).
 function StylusAnnotations:onStrokeTap(ges)
+    logger.warn(("DBG onStrokeTap pos=(%s,%s)"):format(tostring(ges.pos and ges.pos.x), tostring(ges.pos and ges.pos.y)))
     if self:isOverlayActive() then return false end
     local stroke = self:findStrokeAt(ges)
+    logger.warn("DBG onStrokeTap found=" .. tostring(stroke and stroke.id))
+    local tpos = self.ui.view:screenToPageTransform({ x = ges.pos.x, y = ges.pos.y })
+    if tpos then
+        logger.warn(("DBG onStrokeTap page=%s pos=(%.1f,%.1f) zoom=%s"):format(
+            tostring(tpos.page), tpos.x, tpos.y, tostring(tpos.zoom)))
+    else
+        logger.warn("DBG onStrokeTap transform=nil")
+    end
     if not stroke then
         -- Normal reading gesture on empty space: let the reader handle it.
         return false
     end
-    self:setSelection(stroke)
-    self:showStrokeMenu(stroke)
+    self:showStrokeMenu({ stroke })
     return true
+end
+
+-- A long press on a stroke opens the same stroke menu, but selects the stroke
+-- together with every other stroke whose bounding box intersects it, so edits
+-- (delete / color / width) apply to the whole group at once.
+function StylusAnnotations:onStrokeHold(ges)
+    logger.warn(("DBG onStrokeHold pos=(%s,%s)"):format(tostring(ges.pos and ges.pos.x), tostring(ges.pos and ges.pos.y)))
+    if self:isOverlayActive() then return false end
+    local stroke = self:findStrokeAt(ges)
+    logger.warn("DBG onStrokeHold found=" .. tostring(stroke and stroke.id))
+    if not stroke then
+        -- Normal reading hold (text selection, ...): let the reader handle it.
+        return false
+    end
+    self:showStrokeMenu(self:selectStrokesIntersecting(stroke))
+    return true
+end
+
+-- Return { stroke, ... } with every stroke on the same page whose bounding box
+-- intersects the given stroke's bounding box (the given one always included).
+function StylusAnnotations:selectStrokesIntersecting(stroke)
+    local selection = { stroke }
+    local bx0, by0, bx1, by1 = Geometry.strokeBBox(stroke)
+    if not bx0 then return selection end
+    for _, s in ipairs(self.strokes) do
+        if s ~= stroke and s.page == stroke.page then
+            local sx0, sy0, sx1, sy1 = Geometry.strokeBBox(s)
+            if sx0 and sx0 < bx1 and bx0 < sx1 and sy0 < by1 and by0 < sy1 then
+                selection[#selection + 1] = s
+            end
+        end
+    end
+    return selection
 end
 
 function StylusAnnotations:findStrokeAt(ges)
@@ -953,43 +1032,79 @@ function StylusAnnotations:findStrokeAt(ges)
     return best
 end
 
-function StylusAnnotations:setSelection(stroke)
-    if self.selected_stroke == stroke then return end
-    self.selected_stroke = stroke
+-- True if both selections contain exactly the same strokes (order-insensitive).
+function StylusAnnotations:selectionsEqual(a, b)
+    if #a ~= #b then return false end
+    for _, sa in ipairs(a) do
+        local found = false
+        for _, sb in ipairs(b) do
+            if sa == sb then
+                found = true
+                break
+            end
+        end
+        if not found then return false end
+    end
+    return true
+end
+
+function StylusAnnotations:setSelection(strokes)
+    if self:selectionsEqual(self.selected_strokes, strokes) then return end
+    self.selected_strokes = strokes
     -- The stroke menu (modal dialog) is about to be shown and covers the view,
     -- so the view-module paintTo won't run while it's up. Paint the selection
-    -- box straight into the framebuffer and refresh that region, like the
+    -- boxes straight into the framebuffer and refresh that region, like the
     -- live-ink strokes do.
     self:paintSelectionToScreen()
 end
 
 function StylusAnnotations:clearSelection()
-    if not self.selected_stroke then return end
+    if #self.selected_strokes == 0 then return end
     -- Restore the inverted pixels by inverting them back.
     self:paintSelectionToScreen()
-    self.selected_stroke = nil
+    self.selected_strokes = {}
 end
 
--- Invert the selected stroke's bounding box in the framebuffer and refresh that
--- region. Inverting twice (set + clear) restores the original pixels.
+-- Invert each selected stroke's bounding box in the framebuffer and refresh
+-- those regions. Inverting twice (set + clear) restores the original pixels.
 function StylusAnnotations:paintSelectionToScreen()
-    local stroke = self.selected_stroke
-    if not stroke then return end
-    local rx, ry, rw, rh = self:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
-    if not rx then return end
-    Screen.bb:invertRect(rx, ry, rw, rh)
-    self:refreshRegion({ x = rx, y = ry, w = rw, h = rh })
+    for _, stroke in ipairs(self.selected_strokes) do
+        local rx, ry, rw, rh = self:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
+        if rx then
+            Screen.bb:invertRect(rx, ry, rw, rh)
+            self:refreshRegion({ x = rx, y = ry, w = rw, h = rh })
+        end
+    end
 end
 
-function StylusAnnotations:showStrokeMenu(stroke)
-    self:setSelection(stroke)
+-- Union of the screen boxes of a group of strokes, for anchoring the menu and
+-- the selection pad. Returns nil if none of the strokes fall on screen.
+function StylusAnnotations:getSelectionUnionBox(strokes)
+    local x0, y0, x1, y1
+    for _, stroke in ipairs(strokes) do
+        local sx0, sy0, sx1, sy1 = self:getStrokeScreenBox(stroke)
+        if sx0 then
+            if not x0 or sx0 < x0 then x0 = sx0 end
+            if not y0 or sy0 < y0 then y0 = sy0 end
+            if not x1 or sx1 > x1 then x1 = sx1 end
+            if not y1 or sy1 > y1 then y1 = sy1 end
+        end
+    end
+    return x0, y0, x1, y1
+end
+
+-- Group stroke menu: edits (delete / color / width) apply to every stroke in
+-- `strokes` at once. Called with a single-element list by the single tap path.
+function StylusAnnotations:showStrokeMenu(strokes)
+    logger.warn(("DBG showStrokeMenu strokes=%d"):format(#strokes))
+    self:setSelection(strokes)
     local dialog
     dialog = ButtonDialog:new{
         width_factor = 0.45,
         anchor = function()
-            local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
+            local x0, y0, x1, y1 = self:getSelectionUnionBox(strokes)
             if not x0 then return end
-            local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
+            local pad = math.max(4, math.floor(strokes[1].width * (strokes[1].zoom or 1)) + 2)
             return { x = x0 - pad, y = y0 - pad, w = (x1 - x0) + 2 * pad, h = (y1 - y0) + 2 * pad }
         end,
         tap_close_callback = function()
@@ -1000,9 +1115,10 @@ function StylusAnnotations:showStrokeMenu(stroke)
                 {
                     text = "\u{F48E}", -- Trash can (same icon as highlight delete)
                     callback = function()
+                        local count = #strokes
                         self:clearSelection()
                         UIManager:close(dialog)
-                        self:deleteStroke(stroke, false)
+                        self:deleteStrokes(strokes, count > 1)
                     end,
                 },
                 {
@@ -1010,7 +1126,7 @@ function StylusAnnotations:showStrokeMenu(stroke)
                     callback = function()
                         self:clearSelection()
                         UIManager:close(dialog)
-                        self:chooseStrokeColor(stroke)
+                        self:chooseStrokeColor(strokes)
                     end,
                 },
                 {
@@ -1018,7 +1134,7 @@ function StylusAnnotations:showStrokeMenu(stroke)
                     callback = function()
                         self:clearSelection()
                         UIManager:close(dialog)
-                        self:chooseStrokeWidth(stroke)
+                        self:chooseStrokeWidth(strokes)
                     end,
                 },
             },
@@ -1028,10 +1144,11 @@ function StylusAnnotations:showStrokeMenu(stroke)
 end
 
 -- Swatch color picker, mirroring ReaderHighlight:editHighlightColor
--- (the same ButtonSelector the text highlights pop for "Color").
-function StylusAnnotations:chooseStrokeColor(stroke)
-    self:showColorPicker(stroke.color, function(value)
-        self:setStrokeColor(stroke, value)
+-- (the same ButtonSelector the text highlights pop for "Color"). The choice
+-- applies to every stroke in the selection at once.
+function StylusAnnotations:chooseStrokeColor(strokes)
+    self:showColorPicker(strokes[1].color, function(value)
+        self:setStrokeColor(strokes, value)
     end)
 end
 
@@ -1067,31 +1184,35 @@ function StylusAnnotations:showColorPicker(current, apply)
     UIManager:show(selector)
 end
 
-function StylusAnnotations:chooseStrokeWidth(stroke)
+function StylusAnnotations:chooseStrokeWidth(strokes)
     local width_selector
     local width_choices = {}
     for _, w in ipairs(WIDTH_CHOICES) do
         width_choices[#width_choices + 1] = { tostring(w), w }
     end
     width_selector = ButtonSelector:new{
-        current_value = stroke.width,
+        current_value = strokes[1].width,
         values = width_choices,
         callback = function(value)
-            self:setStrokeWidth(stroke, value)
+            self:setStrokeWidth(strokes, value)
             UIManager:close(width_selector)
         end,
     }
     UIManager:show(width_selector)
 end
 
-function StylusAnnotations:setStrokeColor(stroke, color)
-    stroke.color = color
-    self:afterStrokeModified(stroke)
+function StylusAnnotations:setStrokeColor(strokes, color)
+    for _, stroke in ipairs(strokes) do
+        stroke.color = color
+    end
+    self:afterStrokeModified(strokes[1])
 end
 
-function StylusAnnotations:setStrokeWidth(stroke, width)
-    stroke.width = width
-    self:afterStrokeModified(stroke)
+function StylusAnnotations:setStrokeWidth(strokes, width)
+    for _, stroke in ipairs(strokes) do
+        stroke.width = width
+    end
+    self:afterStrokeModified(strokes[1])
 end
 
 function StylusAnnotations:afterStrokeModified(stroke)
@@ -1099,21 +1220,26 @@ function StylusAnnotations:afterStrokeModified(stroke)
     UIManager:setDirty(self.view, "partial")
 end
 
-function StylusAnnotations:deleteStroke(stroke, notify)
-    if self.selected_stroke == stroke then
-        self.selected_stroke = nil
+function StylusAnnotations:deleteStrokes(strokes, notify)
+    local to_delete = {}
+    for _, stroke in ipairs(strokes) do
+        to_delete[stroke] = true
     end
-    for i, s in ipairs(self.strokes) do
-        if s == stroke then
-            table.remove(self.strokes, i)
-            break
+    local keep = {}
+    local removed = 0
+    for _, stroke in ipairs(self.strokes) do
+        if to_delete[stroke] then
+            removed = removed + 1
+        else
+            keep[#keep + 1] = stroke
         end
     end
+    self.strokes = keep
     self:rebuildPageIndex()
     self:scheduleSave()
     UIManager:setDirty(self.view, "partial")
     if notify ~= false then
-        self:notifyStrokeDeleted(1)
+        self:notifyStrokeDeleted(removed)
     end
 end
 
