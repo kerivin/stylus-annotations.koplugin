@@ -1,13 +1,5 @@
---[[--
-Geometry helpers for the Stylus annotations plugin.
-Pure functions for stroke hit-testing.
-
-@module stylus_annotations.lib.geometry
---]]--
-
 local Geometry = {}
 
---- Squared distance from a point to a line segment.
 local function pointSegmentDistanceSq(px, py, x1, y1, x2, y2)
     local dx, dy = x2 - x1, y2 - y1
     local len_sq = dx * dx + dy * dy
@@ -21,10 +13,6 @@ local function pointSegmentDistanceSq(px, py, x1, y1, x2, y2)
     return ex * ex + ey * ey
 end
 
---- Squared distance from a point to a stroke's polyline.
--- @param px, py point coordinates (native page space)
--- @param stroke table with a points array of { x =, y = } entries
--- @return number squared distance, math.huge if the stroke has no points
 function Geometry.strokeDistanceSq(px, py, stroke)
     if not stroke or not stroke.points or #stroke.points == 0 then
         return math.huge
@@ -46,14 +34,6 @@ function Geometry.strokeDistanceSq(px, py, stroke)
     return min_sq
 end
 
---- True if the point is within threshold of the stroke.
-function Geometry.isPointNearStroke(px, py, stroke, threshold)
-    return Geometry.strokeDistanceSq(px, py, stroke) <= threshold * threshold
-end
-
---- Axis-aligned bounding box of a stroke's points (native page space).
--- @param stroke table with a points array of { x =, y = } entries
--- @return x0, y0, x1, y1 (inclusive bounds) or nil if the stroke has no points
 function Geometry.strokeBBox(stroke)
     local pts = stroke and stroke.points
     if not pts or #pts == 0 then
@@ -71,8 +51,6 @@ function Geometry.strokeBBox(stroke)
     return x0, y0, x1, y1
 end
 
---- True if two strokes' bounding boxes intersect (positive overlap area,
--- touching edges/corners don't count).
 function Geometry.strokesIntersect(a, b)
     local ax0, ay0, ax1, ay1 = Geometry.strokeBBox(a)
     local bx0, by0, bx1, by1 = Geometry.strokeBBox(b)
@@ -81,3 +59,4 @@ function Geometry.strokesIntersect(a, b)
 end
 
 return Geometry
+
