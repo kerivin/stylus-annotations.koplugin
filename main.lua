@@ -1347,7 +1347,13 @@ function StylusAnnotations:deleteAllStrokesOnPage()
     for _, page in ipairs(pages) do
         count = count + #(self.strokes_by_page[page] or {})
     end
-    if count == 0 then return end
+    if count == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No strokes to delete."),
+            timeout = 2,
+        })
+        return
+    end
     UIManager:show(ConfirmBox:new{
         text = T(_("Delete all %1 strokes on this page?"), count),
         ok_text = _("Delete"),
@@ -1379,6 +1385,13 @@ end
 
 function StylusAnnotations:deleteAllStrokes()
     local total = #self.strokes
+    if total == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No strokes to delete."),
+            timeout = 2,
+        })
+        return
+    end
     UIManager:show(ConfirmBox:new{
         text = T(_("Delete all %1 strokes for this document?"), total),
         ok_text = _("Delete"),
