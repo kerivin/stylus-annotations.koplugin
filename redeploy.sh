@@ -17,21 +17,39 @@ else
     ADB=adb
 fi
 
-echo "Using adb: $ADB"
-"$ADB" shell "am force-stop $PKG"
-"$ADB" shell "run-as $PKG sh -c 'cat > $DEST/main.lua'" < main.lua
+md5_of() {
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$1" | cut -d' ' -f1
+    else
+        md5 -q "$1"
+    fi
+}
 
-LOCAL=$(md5sum main.lua | cut -d' ' -f1)
-REMOTE=$("$ADB" shell "run-as $PKG md5sum $DEST/main.lua" | tr -d '\r' | cut -d' ' -f1)
-if [ "$LOCAL" = "$REMOTE" ]; then
-    echo "deploy: OK"
-else
-    echo "deploy: MISMATCH (local=$LOCAL remote=$REMOTE)" >&2
-    exit 1
-fi
+FILES=$(find main.lua _meta.lua lib -type f)
+
+echo "Using adb: $ADB"
+echo "Stopping $PKG"
+"$ADB" shell "am force-stop $PKG"
+
+echo "Pushing plugin files"
+"$ADB" shell "run-as $PKG sh -c 'rm -rf $DEST && mkdir -p $DEST'" 
+tar -cf - $FILES 2>/dev/null | "$ADB" shell "run-as $PKG sh -c 'cd $DEST && tar -xf -'" >/dev/null 2>&1 || true 
+
+echo "Verifying checksums"
+FAIL=0
+for f in $FILES; do
+    L=$(md5_of "$f")
+    R=$("$ADB" shell "run-as $PKG md5sum $DEST/$f" | tr -d '\r' | cut -d' ' -f1)
+    if [ -n "$R" ] && [ "$L" = "$R" ]; then
+        echo "  ok $f"
+    else
+        echo "  MISMATCH $f (local=$L remote=$R)" >&2
+        FAIL=1
+    fi
+done
+if [ "$FAIL" != "0" ]; then exit 1; fi
 
 "$ADB" logcat -c
 "$ADB" shell "am start -n $PKG/org.koreader.launcher.MainActivity"
-
 sleep 16
 "$ADB" logcat -d | grep -iE "Plugin loaded stylus|error|nil value" | tail -4
