@@ -21,6 +21,38 @@ local T = require("ffi/util").template
 
 local Screen = Device.screen
 
+local function stampDisc(bb, cx, cy, r, color)
+    local r2 = r * r
+    local cyi = math.floor(cy)
+    for dy = -math.floor(r), math.floor(r) do
+        local span = math.floor(math.sqrt(r2 - dy * dy) + 0.5)
+        if span > 0 then
+            bb:paintRectRGB32(math.floor(cx) - span, cyi + dy, 2 * span + 1, 1, color)
+        end
+    end
+end
+
+local function stampPath(bb, pts, ox, oy, r, color)
+    local n = #pts
+    if n == 0 then return end
+    local px, py = pts[1].x, pts[1].y
+    stampDisc(bb, ox + px, oy + py, r, color)
+    for i = 2, n do
+        local nx, ny = pts[i].x, pts[i].y
+        local dx, dy = nx - px, ny - py
+        local dist_sq = dx * dx + dy * dy
+        if dist_sq >= 1 then
+            local steps = math.ceil(math.sqrt(dist_sq))
+            for s = 1, steps do
+                stampDisc(bb, ox + px + dx * (s / steps), oy + py + dy * (s / steps), r, color)
+            end
+        else
+            stampDisc(bb, ox + nx, oy + ny, r, color)
+        end
+        px, py = nx, ny
+    end
+end
+
 local SELECTION_WHITE = Blitbuffer.ColorRGB32(0xFF, 0xFF, 0xFF, 0xFF)
 
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
@@ -58,21 +90,14 @@ local WidthPreview = Widget:extend{
         local pad = self.padding
         local draw_w = self.dimen.w - 2 * pad
         local draw_h = self.dimen.h - 2 * pad
-        local half = w / 2
-
-        local function sx(v) return x + pad + v / 100 * draw_w end
-        local function sy(v) return y + pad + v / 100 * draw_h end
-        local px, py = sx(PREVIEW_POINTS[1][1]), sy(PREVIEW_POINTS[1][2])
-        for i = 2, #PREVIEW_POINTS do
-            local nx, ny = sx(PREVIEW_POINTS[i][1]), sy(PREVIEW_POINTS[i][2])
-            local dist = math.sqrt((nx - px) ^ 2 + (ny - py) ^ 2)
-            local steps = math.max(1, math.ceil(dist))
-            for s = 1, steps do
-                local tx, ty = px + (nx - px) * (s / steps), py + (ny - py) * (s / steps)
-                bb:paintRectRGB32(math.floor(tx) - half, math.floor(ty) - half, w, w, Blitbuffer.COLOR_BLACK)
-            end
-            px, py = nx, ny
+        local pts = {}
+        for i = 1, #PREVIEW_POINTS do
+            pts[i] = {
+                x = x + pad + PREVIEW_POINTS[i][1] / 100 * draw_w,
+                y = y + pad + PREVIEW_POINTS[i][2] / 100 * draw_h,
+            }
         end
+        stampPath(bb, pts, 0, 0, w / 2, Blitbuffer.COLOR_BLACK)
     end,
 }
 
@@ -101,6 +126,11 @@ end
 COLOR_HEX.gray = "#808080"
 for _, c in ipairs(EXTRA_COLORS) do
     COLOR_HEX[c[2]] = c[3]
+end
+
+local COLOR_DISPLAY_NAMES = {}
+for _, c in ipairs(COLOR_PALETTE) do
+    COLOR_DISPLAY_NAMES[c[2]] = c[1]
 end
 
 local StylusAnnotations = InputContainer:extend{
@@ -313,7 +343,7 @@ function StylusAnnotations:startStroke(x, y)
     self.current_stroke = {
         id = tostring(self.stroke_id_counter),
         page = pos.page,
-        points = { { x = pos.x, y = pos.y } },
+        points = { pos.x, pos.y },
         width = self.width,
         color = self.color,
         alpha = 1.0,
@@ -355,9 +385,10 @@ function StylusAnnotations:addStrokePoint(x, y)
     if not stroke then return end
     local pos = self.ui.view:screenToPageTransform({ x = x, y = y })
     if pos.page ~= stroke.page then return end
-    local last = stroke.points[#stroke.points]
-    if last and last.x == pos.x and last.y == pos.y then return end
-    table.insert(stroke.points, { x = pos.x, y = pos.y })
+    local pts = stroke.points
+    local m = #pts
+    if m >= 2 and pts[m - 1] == pos.x and pts[m] == pos.y then return end
+    pts[m + 1], pts[m + 2] = pos.x, pos.y
 
     local sw = self:getStrokeScreenWidth(stroke)
     local half = math.floor(sw / 2)
@@ -368,7 +399,7 @@ function StylusAnnotations:addStrokePoint(x, y)
     self:accumulateDirty(seg_x, seg_y, seg_w, seg_h)
 
     if self.live_ink ~= false then
-        self.live_dirty = self:mergeRect(self.live_dirty, seg_x, seg_y, seg_w, seg_h)
+        self.live_dirty = Geometry.mergeRect(self.live_dirty, seg_x, seg_y, seg_w, seg_h)
         self:flushLiveStroke(stroke)
     end
 
@@ -386,7 +417,7 @@ function StylusAnnotations:flushLive()
     local ld = self.live_dirty
     if not ld or ld.w <= 0 or ld.h <= 0 then return end
     self.live_dirty = nil
-    local rx, ry, rw, rh = self:clampRegion(
+    local rx, ry, rw, rh = Geometry.clampRect(
         ld.x, ld.y, ld.w, ld.h, Screen:getWidth(), Screen:getHeight())
     if rx then
         UIManager:setDirty(self.view, function()
@@ -411,7 +442,7 @@ function StylusAnnotations:flushLiveStroke(stroke)
     if self.live_snapshot then
         bb:blitFrom(self.live_snapshot, x0, y0, x0, y0, rw, rh)
     end
-    self.live_dirty = self:mergeRect(ld, x0, y0, rw, rh)
+    self.live_dirty = Geometry.mergeRect(ld, x0, y0, rw, rh)
     self:renderStrokeToScreen(stroke)
     self:flushLive()
 end
@@ -474,21 +505,38 @@ end
 
 function StylusAnnotations:decimatePoints(stroke)
     local pts = stroke.points
-    local n = #pts
-    if n <= 2 then return pts end
-    local MIN_SPACING = 2.5
-    local kept = { pts[1] }
-    local lx, ly = self:pageToScreenPoint(stroke.page, pts[1].x, pts[1].y)
-    for i = 2, n do
-        local p = pts[i]
-        local sx, sy = self:pageToScreenPoint(stroke.page, p.x, p.y)
+    local num = math.floor(#pts / 2)
+    if num <= 2 then return pts end
+    local MIN_SPACING = 2.0
+    local kept = { pts[1], pts[2] }
+    local kept_s = { self:pageToScreenPoint(stroke.page, pts[1], pts[2]) }
+    local lx, ly = kept_s[1], kept_s[2]
+    for i = 2, num - 1 do
+        local xi, yi = pts[2 * i - 1], pts[2 * i]
+        local sx, sy = self:pageToScreenPoint(stroke.page, xi, yi)
         local dx, dy = sx - lx, sy - ly
-        if dx * dx + dy * dy >= MIN_SPACING * MIN_SPACING or i == n then
-            kept[#kept + 1] = p
+        if dx * dx + dy * dy >= MIN_SPACING * MIN_SPACING then
+            kept[#kept + 1], kept[#kept + 2] = xi, yi
+            kept_s[#kept_s + 1], kept_s[#kept_s + 2] = sx, sy
             lx, ly = sx, sy
         end
     end
-    return kept
+    kept[#kept + 1], kept[#kept + 2] = pts[#pts - 1], pts[#pts]
+    local lx2, ly2 = self:pageToScreenPoint(stroke.page, pts[#pts - 1], pts[#pts])
+    kept_s[#kept_s + 1], kept_s[#kept_s + 2] = lx2, ly2
+
+    local num_kept = math.floor(#kept / 2)
+    if num_kept <= 3 then return kept end
+    local tol = math.min(3.0, math.max(0.75, self:getStrokeScreenWidth(stroke) / 4))
+    local idx = Geometry.rdpSimplifyIndices(kept_s, tol)
+    if #idx == num_kept then return kept end
+    local out = {}
+    for p = 1, #idx do
+        local k = idx[p]
+        out[#out + 1] = kept[2 * k - 1]
+        out[#out + 1] = kept[2 * k]
+    end
+    return out
 end
 
 function StylusAnnotations:renderStrokeToScreen(stroke)
@@ -498,7 +546,7 @@ end
 function StylusAnnotations:refreshRegion(region)
 
     if region then
-        local rx, ry, rw, rh = self:clampRegion(
+        local rx, ry, rw, rh = Geometry.clampRect(
             region.x, region.y, region.w, region.h, Screen:getWidth(), Screen:getHeight())
         if rx then
             UIManager:setDirty(self.view, function()
@@ -537,6 +585,10 @@ function StylusAnnotations:getStrokeScreenWidth(stroke)
     return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
 end
 
+function StylusAnnotations:colorDisplayName(name)
+    return COLOR_DISPLAY_NAMES[name] or name
+end
+
 function StylusAnnotations:getPaletteColor(name)
     if self.ui.highlight and not EXTRA_COLOR_NAMES[name] then
         return self.ui.highlight:getHighlightColor(name, nil, Screen.night_mode)
@@ -553,25 +605,7 @@ function StylusAnnotations:getRenderColor(stroke)
 end
 
 function StylusAnnotations:accumulateDirty(x, y, w, h)
-    self.dirty_region = self:mergeRect(self.dirty_region, x, y, w, h)
-end
-
-function StylusAnnotations:mergeRect(region, x, y, w, h)
-    if not region then return { x = x, y = y, w = w, h = h } end
-    local x0 = math.min(region.x, x)
-    local y0 = math.min(region.y, y)
-    local x1 = math.max(region.x + region.w, x + w)
-    local y1 = math.max(region.y + region.h, y + h)
-    return { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
-end
-
-function StylusAnnotations:clampRegion(x, y, w, h, width, height)
-    local rx = math.max(0, math.floor(x))
-    local ry = math.max(0, math.floor(y))
-    local rw = math.min(width - rx, math.ceil(w))
-    local rh = math.min(height - ry, math.ceil(h))
-    if rw <= 0 or rh <= 0 then return end
-    return rx, ry, rw, rh
+    self.dirty_region = Geometry.mergeRect(self.dirty_region, x, y, w, h)
 end
 
 function StylusAnnotations:paintTo(bb, x, y)
@@ -616,81 +650,56 @@ function StylusAnnotations:paintStroke(bb, x, y, stroke)
     local color = self:getRenderColor(stroke)
     local sw = self:getPageZoom(stroke.page) * stroke.width
     local pts = stroke.points
-    local n = #pts
-    if n == 0 then return end
+    local m = #pts
+    if m == 0 then return end
     local sph = {}
-    for i = 1, n do
-        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i].x, pts[i].y)
+    for i = 1, m, 2 do
+        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i], pts[i + 1])
         if not sx then return end
-        sph[i] = { x = x + sx, y = y + sy }
+        sph[#sph + 1] = { x = x + sx, y = y + sy }
     end
     self:drawStrokePath(bb, sph, sw, color)
 end
 
 function StylusAnnotations:getStrokeScreenBox(stroke)
     local pts = stroke.points
-    local n = #pts
-    if n == 0 then return end
-    local x0, y0, x1, y1
-    for i = 1, n do
-        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i].x, pts[i].y)
+    local m = #pts
+    if m == 0 then return end
+    local spts = {}
+    for i = 1, m, 2 do
+        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i], pts[i + 1])
         if not sx then return end
-        if not x0 or sx < x0 then x0 = sx end
-        if not x1 or sx > x1 then x1 = sx end
-        if not y0 or sy < y0 then y0 = sy end
-        if not y1 or sy > y1 then y1 = sy end
+        spts[#spts + 1], spts[#spts + 2] = sx, sy
     end
-    return x0, y0, x1, y1
+    return Geometry.screenBounds(spts)
 end
 
 function StylusAnnotations:getSelectionRect(stroke, width, height)
     local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
     if not x0 then return end
     local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
-    return self:clampRegion(x0 - pad, y0 - pad, (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad, width, height)
+    return Geometry.clampRect(x0 - pad, y0 - pad, (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad, width, height)
 end
 
 function StylusAnnotations:paintStrokeSolid(bb, x, y, stroke, color)
     local sw = self:getPageZoom(stroke.page) * stroke.width
-    local half = math.floor(sw / 2)
     local pts = stroke.points
-    local n = #pts
-    if n == 0 then return end
-    local function stamp(cx, cy)
-        bb:paintRectRGB32(math.floor(cx) - half, math.floor(cy) - half, sw, sw, color)
+    local m = #pts
+    if m == 0 then return end
+    local sph = {}
+    for i = 1, m, 2 do
+        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i], pts[i + 1])
+        if not sx then return end
+        sph[#sph + 1] = { x = x + sx, y = y + sy }
     end
-    local sx, sy = self:pageToScreenPoint(stroke.page, pts[1].x, pts[1].y)
-    if not sx then return end
-    stamp(x + sx, y + sy)
-    for i = 2, n do
-        local nx, ny = self:pageToScreenPoint(stroke.page, pts[i].x, pts[i].y)
-        if not nx then return end
-        local dx, dy = nx - sx, ny - sy
-        local dist = math.sqrt(dx * dx + dy * dy)
-        local steps = math.max(1, math.ceil(dist))
-        for s = 1, steps do
-            stamp(x + sx + dx * (s / steps), y + sy + dy * (s / steps))
-        end
-        sx, sy = nx, ny
-    end
+    stampPath(bb, sph, 0, 0, sw / 2, color)
 end
 
 function StylusAnnotations:drawStrokePath(bb, sph, sw, color)
     local n = #sph
     if n == 0 then return end
     local half = math.floor(sw / 2)
-    local function stamp(mask, sx, sy)
-        mask:paintRectRGB32(
-            math.floor(sx) - half, math.floor(sy) - half, sw, sw, color)
-    end
-    local min_x, min_y, max_x, max_y
-    for i = 1, n do
-        local px, py = sph[i].x, sph[i].y
-        if not min_x or px < min_x then min_x = px end
-        if not max_x or px > max_x then max_x = px end
-        if not min_y or py < min_y then min_y = py end
-        if not max_y or py > max_y then max_y = py end
-    end
+    local min_x, min_y, max_x, max_y = Geometry.pointsBounds(sph)
     local box_x = math.max(0, math.floor(min_x - half))
     local box_y = math.max(0, math.floor(min_y - half))
     local box_w = math.ceil(max_x + half) - box_x
@@ -704,26 +713,7 @@ function StylusAnnotations:drawStrokePath(bb, sph, sw, color)
     if not mask then return end
     mask:paintRect(0, 0, box_w, box_h, Blitbuffer.COLOR_WHITE)
 
-    if n == 1 then
-        stamp(mask, sph[1].x - box_x, sph[1].y - box_y)
-    else
-        local x1, y1 = sph[1].x, sph[1].y
-        stamp(mask, x1 - box_x, y1 - box_y)
-        for i = 2, n do
-            local x2, y2 = sph[i].x, sph[i].y
-            local dx, dy = x2 - x1, y2 - y1
-            local dist_sq = dx * dx + dy * dy
-            if dist_sq >= 1 then
-                local steps = math.ceil(math.sqrt(dist_sq))
-                for s = 1, steps do
-                    stamp(mask, x1 - box_x + dx * (s / steps), y1 - box_y + dy * (s / steps))
-                end
-            else
-                stamp(mask, x2 - box_x, y2 - box_y)
-            end
-            x1, y1 = x2, y2
-        end
-    end
+    stampPath(mask, sph, -box_x, -box_y, sw / 2, color)
 
     if bb:getInverse() == 1 then
         local rb = color:getColorRGB32()
@@ -1170,9 +1160,24 @@ function StylusAnnotations:loadStrokes()
     f:close()
     local ok, data = pcall(dofile, filepath)
     if ok and data and data.strokes then
+        self:normalizeStrokes(data.strokes)
         self.strokes = data.strokes
         self:rebuildPageIndex()
         logger.info("StylusAnnotations: loaded", #self.strokes, "strokes from", filepath)
+    end
+end
+
+function StylusAnnotations:normalizeStrokes(strokes)
+    for _, stroke in ipairs(strokes) do
+        local pts = stroke and stroke.points
+        if pts and #pts > 0 and type(pts[1]) == "table" then
+            local flat = {}
+            for i = 1, #pts do
+                flat[#flat + 1] = pts[i].x
+                flat[#flat + 1] = pts[i].y
+            end
+            stroke.points = flat
+        end
     end
 end
 
@@ -1221,13 +1226,17 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Width..."),
+                text_func = function()
+                    return T(_("Width: %1"), self.width)
+                end,
                 callback = function()
                     self:choosePenWidth()
                 end,
             },
             {
-                text = _("Color..."),
+                text_func = function()
+                    return T(_("Color: %1"), self:colorDisplayName(self.color))
+                end,
                 callback = function()
                     self:choosePenColor()
                 end,
