@@ -1,6 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
-local Geometry = require("lib/geometry")
+local Geometry = require("core/geometry")
 local ReaderHighlight = require("apps/reader/modules/readerhighlight")
 local _ = require("gettext")
 

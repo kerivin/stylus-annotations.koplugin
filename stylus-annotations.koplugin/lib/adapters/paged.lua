@@ -1,4 +1,4 @@
-local Geometry = require("lib/geometry")
+local Geometry = require("core/geometry")
 local Base = require("lib/adapters/base")
 
 local Paged = {}
@@ -105,10 +105,10 @@ end
 function Paged:forEachVisibleStroke(fn)
     local pages = self:getVisiblePages()
     if not pages then return end
-    local plugin = self.plugin
+    local store = self.plugin.store
     for _, page in ipairs(pages) do
-        for _, idx in ipairs(plugin.strokes_by_page[page] or {}) do
-            fn(plugin.strokes[idx])
+        for _, idx in ipairs(store.strokes_by_page[page] or {}) do
+            fn(store.strokes[idx])
         end
     end
 end

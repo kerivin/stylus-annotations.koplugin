@@ -1,5 +1,5 @@
 local Device = require("device")
-local Geometry = require("lib/geometry")
+local Geometry = require("core/geometry")
 local Base = require("lib/adapters/base")
 
 local Screen = Device.screen
@@ -79,7 +79,7 @@ function Reflow:strokeSameContext(a, b)
 end
 
 function Reflow:forEachVisibleStroke(fn)
-    for _, stroke in ipairs(self.plugin.strokes) do
+    for _, stroke in ipairs(self.plugin.store.strokes) do
         if not self:strokeCulled(stroke) then
             fn(stroke)
         end

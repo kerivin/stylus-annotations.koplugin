@@ -2,10 +2,11 @@ local Blitbuffer = require("ffi/blitbuffer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
-local Geometry = require("lib/geometry")
+local Geometry = require("core/geometry")
 local Draw = require("lib/draw")
 local PagedAdapter = require("lib/adapters/paged")
 local ReflowAdapter = require("lib/adapters/reflow")
+local StrokeStore = require("core/store")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local Event = require("ui/event")
@@ -16,7 +17,6 @@ local SpinWidget = require("ui/widget/spinwidget")
 local Widget = require("ui/widget/widget")
 local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
-local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local dbg = require("dbg")
 local _ = require("gettext")
@@ -35,8 +35,6 @@ local LIVE_REFRESH_DELAY_S = 0.7
 
 local DEFAULT_WIDTH = 2
 local DEFAULT_COLOR = "orange"
-
-local STORAGE_VERSION = 1
 
 local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
 
@@ -77,8 +75,7 @@ local StylusAnnotations = InputContainer:extend{
     name = "stylus_annotations",
     is_doc_only = true,
 
-    strokes = nil,
-    strokes_by_page = nil,
+    store = nil,
 
     stylus_callback_registered = false,
     touch_zones_registered = false,
@@ -101,13 +98,12 @@ local StylusAnnotations = InputContainer:extend{
 }
 
 function StylusAnnotations:init()
-    self.strokes = {}
-    self.strokes_by_page = {}
     self.stroke_id_counter = 0
 
     self.view = self.ui.view
 
     self.adapter = (self.ui.paging and PagedAdapter:new(self) or ReflowAdapter:new(self))
+    self.store = StrokeStore:new(self.adapter, logger)
 
     self:loadSettings()
 
@@ -127,7 +123,7 @@ function StylusAnnotations:init()
 
     dbg:turnOff()
 
-    logger.info("StylusAnnotations: initialized, strokes =", #self.strokes)
+    logger.info("StylusAnnotations: initialized, strokes =", #self.store.strokes)
 end
 
 function StylusAnnotations:onReaderReady()
@@ -412,12 +408,9 @@ function StylusAnnotations:endStroke()
     self.dirty_region = nil
     if not stroke or #stroke.points == 0 then return end
 
-    stroke.points = self.adapter:decimatePoints(stroke)
+    stroke.points = self.store:decimatePoints(stroke)
 
-    table.insert(self.strokes, stroke)
-    local idx = #self.strokes
-    self.strokes_by_page[stroke.page] = self.strokes_by_page[stroke.page] or {}
-    table.insert(self.strokes_by_page[stroke.page], idx)
+    self.store:add(stroke)
 
     self:scheduleSave()
 
@@ -446,7 +439,7 @@ function StylusAnnotations:scheduleRefresh()
 end
 
 function StylusAnnotations:decimatePoints(stroke)
-    return self.adapter:decimatePoints(stroke)
+    return self.store:decimatePoints(stroke)
 end
 
 function StylusAnnotations:renderStrokeToScreen(stroke)
@@ -486,7 +479,7 @@ function StylusAnnotations:onStrokeCancel()
 end
 
 function StylusAnnotations:showStrokeMenuAt(x, y)
-    local stroke = self.adapter:findStrokeAt(x, y)
+    local stroke = self.store:findStrokeAt(x, y)
     if not stroke then return end
     self:showStrokeMenu({ stroke })
 end
@@ -524,11 +517,11 @@ function StylusAnnotations:getPageZoom(page)
 end
 
 function StylusAnnotations:getStrokeScreenBox(stroke)
-    return self.adapter:getStrokeScreenBox(stroke)
+    return self.store:getStrokeScreenBox(stroke)
 end
 
 function StylusAnnotations:getSelectionRect(stroke, width, height)
-    return self.adapter:getSelectionRect(stroke, width, height)
+    return self.store:getSelectionRect(stroke, width, height)
 end
 
 function StylusAnnotations:paintStrokeSolid(bb, x, y, stroke, color)
@@ -606,12 +599,12 @@ function StylusAnnotations:onStrokeHold(ges)
 end
 
 function StylusAnnotations:selectStrokesChain(stroke)
-    return self.adapter:selectStrokesChain(stroke)
+    return self.store:selectStrokesChain(stroke)
 end
 
 function StylusAnnotations:findStrokeAt(ges)
-    if #self.strokes == 0 or not ges or not ges.pos then return nil end
-    return self.adapter:findStrokeAt(ges.pos.x, ges.pos.y)
+    if #self.store.strokes == 0 or not ges or not ges.pos then return nil end
+    return self.store:findStrokeAt(ges.pos.x, ges.pos.y)
 end
 
 function StylusAnnotations:selectionsEqual(a, b)
@@ -691,17 +684,7 @@ function StylusAnnotations:restoreSelectionBackup()
 end
 
 function StylusAnnotations:getSelectionUnionBox(strokes)
-    local x0, y0, x1, y1
-    for _, stroke in ipairs(strokes) do
-        local sx0, sy0, sx1, sy1 = self:getStrokeScreenBox(stroke)
-        if sx0 then
-            if not x0 or sx0 < x0 then x0 = sx0 end
-            if not y0 or sy0 < y0 then y0 = sy0 end
-            if not x1 or sx1 > x1 then x1 = sx1 end
-            if not y1 or sy1 > y1 then y1 = sy1 end
-        end
-    end
-    return x0, y0, x1, y1
+    return self.store:getSelectionUnionBox(strokes)
 end
 
 function StylusAnnotations:showStrokeMenu(strokes)
@@ -793,16 +776,12 @@ function StylusAnnotations:chooseStrokeWidth(strokes)
 end
 
 function StylusAnnotations:setStrokeColor(strokes, color)
-    for _, stroke in ipairs(strokes) do
-        stroke.color = color
-    end
+    self.store:setField(strokes, "color", color)
     self:afterStrokeModified(strokes[1])
 end
 
 function StylusAnnotations:setStrokeWidth(strokes, width)
-    for _, stroke in ipairs(strokes) do
-        stroke.width = width
-    end
+    self.store:setField(strokes, "width", width)
     self:afterStrokeModified(strokes[1])
 end
 
@@ -812,21 +791,7 @@ function StylusAnnotations:afterStrokeModified(stroke)
 end
 
 function StylusAnnotations:deleteStrokes(strokes, notify)
-    local to_delete = {}
-    for _, stroke in ipairs(strokes) do
-        to_delete[stroke] = true
-    end
-    local keep = {}
-    local removed = 0
-    for _, stroke in ipairs(self.strokes) do
-        if to_delete[stroke] then
-            removed = removed + 1
-        else
-            keep[#keep + 1] = stroke
-        end
-    end
-    self.strokes = keep
-    self:rebuildPageIndex()
+    local removed = self.store:remove(strokes)
     self:scheduleSave()
     UIManager:setDirty(self.view, "partial")
     if notify ~= false then
@@ -848,7 +813,7 @@ function StylusAnnotations:notifyStrokeDeleted(count)
 end
 
 function StylusAnnotations:rebuildPageIndex()
-    self.adapter:rebuildPageIndex()
+    self.store:rebuildPageIndex()
 end
 
 function StylusAnnotations:getStrokesFilePath()
@@ -877,92 +842,19 @@ function StylusAnnotations:saveStrokes()
         logger.warn("StylusAnnotations: no sidecar dir available, skipping save")
         return
     end
-    local strokes = self.strokes
-    if #strokes == 0 then
-        if lfs.attributes(filepath, "mode") == "file" then
-            os.remove(filepath)
-            logger.info("StylusAnnotations: no strokes, removed", filepath)
-        end
-        return
-    end
-    local sidecar_dir = self.ui.doc_settings.doc_sidecar_dir
-    if sidecar_dir then
-        local ok, err = lfs.mkdir(sidecar_dir)
-        if not ok and err ~= "File exists" then
-            logger.warn("StylusAnnotations: failed to create sidecar dir:", err)
-        end
-    end
-    local out = { "return {", tostring(STORAGE_VERSION), ",strokes={" }
-    for i = 1, #strokes do
-        local stroke = strokes[i]
-        if i > 1 then out[#out + 1] = "," end
-        out[#out + 1] = "{id=" .. string.format("%q", tostring(stroke.id))
-        out[#out + 1] = "," .. self.adapter:serializeStroke(stroke)
-        out[#out + 1] = ",width=" .. tostring(stroke.width)
-        out[#out + 1] = ",color=" .. string.format("%q", stroke.color)
-        if (stroke.zoom or 1) ~= 1 then
-            out[#out + 1] = ",zoom=" .. tostring(stroke.zoom or 1)
-        end
-        if (stroke.alpha or 1) ~= 1 then
-            out[#out + 1] = ",alpha=" .. tostring(stroke.alpha or 1)
-        end
-        out[#out + 1] = ",datetime=" .. tostring(stroke.datetime or 0)
-        out[#out + 1] = "}"
-    end
-    out[#out + 1] = "}}\n"
-
-    local f, err = io.open(filepath, "w")
-    if f then
-        f:write(table.concat(out))
-        f:close()
-        logger.info("StylusAnnotations: saved", #strokes, "strokes")
-    else
-        logger.err("StylusAnnotations: failed to write strokes:", err)
-    end
+    self.store:save(filepath)
 end
 
 function StylusAnnotations:loadStrokes()
     local filepath = self:getStrokesFilePath()
-    self.strokes = {}
-    self.strokes_by_page = {}
-    if not filepath then return end
-    local f = io.open(filepath, "r")
-    if not f then return end
-    f:close()
-    local ok, data = pcall(dofile, filepath)
-    if ok and data and data.strokes then
-        local saved_version = self:migrateStrokes(data)
-        local loaded = {}
-        for _, stroke_data in ipairs(data.strokes) do
-            local stroke = self.adapter:deserializeStroke(stroke_data)
-            if stroke then
-                loaded[#loaded + 1] = stroke
-            end
-        end
-        self.strokes = loaded
-        self:rebuildPageIndex()
-        logger.info("StylusAnnotations: loaded", #self.strokes, "strokes from", filepath)
-        if saved_version ~= STORAGE_VERSION then
-            self:scheduleSave()
-        end
+    if not filepath then
+        self.store:load(nil)
+        return
     end
-end
-
-function StylusAnnotations:migrateStrokes(data)
-    local version = data.version or STORAGE_VERSION
-    if version > STORAGE_VERSION then
-        logger.warn("StylusAnnotations: sidecar version", version,
-            "newer than supported", STORAGE_VERSION, "; attempting to load anyway")
+    local migrated = self.store:load(filepath)
+    if migrated then
+        self:scheduleSave()
     end
-    for v = version, STORAGE_VERSION - 1 do
-        self:upgradeStrokesVersion(data, v)
-    end
-    data.version = STORAGE_VERSION
-    return version
-end
-
-function StylusAnnotations:upgradeStrokesVersion(data, from)
-    if from == STORAGE_VERSION then return end
 end
 
 function StylusAnnotations:onStylusAnnotationsToggle()
@@ -1138,7 +1030,7 @@ function StylusAnnotations:deleteAllStrokesOnPage()
     if not pages then return end
     local count = 0
     for _, page in ipairs(pages) do
-        count = count + #(self.strokes_by_page[page] or {})
+        count = count + #(self.store.strokes_by_page[page] or {})
     end
     if count == 0 then
         UIManager:show(InfoMessage:new{
@@ -1151,24 +1043,7 @@ function StylusAnnotations:deleteAllStrokesOnPage()
         text = T(_("Delete all %1 strokes on this page?"), count),
         ok_text = _("Delete"),
         ok_callback = function()
-            local keep = {}
-            local removed = 0
-            for i, stroke in ipairs(self.strokes) do
-                local remove = false
-                for _, page in ipairs(pages) do
-                    if stroke.page == page then
-                        remove = true
-                        break
-                    end
-                end
-                if remove then
-                    removed = removed + 1
-                else
-                    keep[#keep + 1] = stroke
-                end
-            end
-            self.strokes = keep
-            self:rebuildPageIndex()
+            local removed = self.store:removeByPage(pages)
             self:scheduleSave()
             UIManager:setDirty(self.view, "partial")
             self:notifyStrokeDeleted(removed)
@@ -1177,7 +1052,7 @@ function StylusAnnotations:deleteAllStrokesOnPage()
 end
 
 function StylusAnnotations:deleteAllStrokes()
-    local total = #self.strokes
+    local total = #self.store.strokes
     if total == 0 then
         UIManager:show(InfoMessage:new{
             text = _("No strokes to delete."),
@@ -1189,11 +1064,10 @@ function StylusAnnotations:deleteAllStrokes()
         text = T(_("Delete all %1 strokes for this document?"), total),
         ok_text = _("Delete"),
         ok_callback = function()
-            self.strokes = {}
-            self:rebuildPageIndex()
+            local removed = self.store:removeAll()
             self:scheduleSave()
             UIManager:setDirty(self.view, "partial")
-            self:notifyStrokeDeleted(total)
+            self:notifyStrokeDeleted(removed)
         end,
     })
 end
