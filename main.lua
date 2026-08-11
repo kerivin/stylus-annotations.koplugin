@@ -66,6 +66,8 @@ local LIVE_REFRESH_DELAY_S = 0.7
 local DEFAULT_WIDTH = 2
 local DEFAULT_COLOR = "orange"
 
+local STORAGE_VERSION = 1
+
 local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
 
 local PREVIEW_POINTS = {
@@ -1140,7 +1142,7 @@ function StylusAnnotations:saveStrokes()
             logger.warn("StylusAnnotations: failed to create sidecar dir:", err)
         end
     end
-    local data = { version = 1, strokes = self.strokes }
+    local data = { version = STORAGE_VERSION, strokes = self.strokes }
     local f, err = io.open(filepath, "w")
     if f then
         f:write("return " .. require("dump")(data))
@@ -1160,23 +1162,41 @@ function StylusAnnotations:loadStrokes()
     f:close()
     local ok, data = pcall(dofile, filepath)
     if ok and data and data.strokes then
-        self:normalizeStrokes(data.strokes)
+        local saved_version = self:migrateStrokes(data)
         self.strokes = data.strokes
         self:rebuildPageIndex()
         logger.info("StylusAnnotations: loaded", #self.strokes, "strokes from", filepath)
+        if saved_version and saved_version ~= STORAGE_VERSION then
+            self:scheduleSave()
+        end
     end
 end
 
-function StylusAnnotations:normalizeStrokes(strokes)
-    for _, stroke in ipairs(strokes) do
-        local pts = stroke and stroke.points
-        if pts and #pts > 0 and type(pts[1]) == "table" then
-            local flat = {}
-            for i = 1, #pts do
-                flat[#flat + 1] = pts[i].x
-                flat[#flat + 1] = pts[i].y
+function StylusAnnotations:migrateStrokes(data)
+    local version = data.version or 0
+    if version > STORAGE_VERSION then
+        logger.warn("StylusAnnotations: sidecar version", version,
+            "newer than supported", STORAGE_VERSION, "; attempting to load anyway")
+    end
+    for v = version, STORAGE_VERSION - 1 do
+        self:upgradeStrokesVersion(data, v)
+    end
+    data.version = STORAGE_VERSION
+    return version
+end
+
+function StylusAnnotations:upgradeStrokesVersion(data, from)
+    if from == 0 then
+        for _, stroke in ipairs(data.strokes or {}) do
+            local pts = stroke and stroke.points
+            if pts and #pts > 0 and type(pts[1]) == "table" then
+                local flat = {}
+                for i = 1, #pts do
+                    flat[#flat + 1] = pts[i].x
+                    flat[#flat + 1] = pts[i].y
+                end
+                stroke.points = flat
             end
-            stroke.points = flat
         end
     end
 end
