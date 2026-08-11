@@ -36,20 +36,25 @@ md5_of() {
     fi
 }
 
-FILES=$(find main.lua _meta.lua lib -type f)
+PLUGIN_DIR=stylus-annotations.koplugin
+if [ ! -d "$PLUGIN_DIR" ]; then
+    echo "Missing plugin directory $PLUGIN_DIR. Aborting." >&2
+    exit 1
+fi
+FILES=$(cd "$PLUGIN_DIR" && find . -type f | sed 's|^\./||')
 
 push_plugin() {
     DEST=$1
     echo "-> $DEST"
     "$ADB" $ADB_ARGS shell "run-as $PKG sh -c 'rm -rf $DEST && mkdir -p $DEST'"
-    tar -cf - $FILES 2>/dev/null | "$ADB" $ADB_ARGS shell "run-as $PKG sh -c 'cd $DEST && tar -xf -'" >/dev/null 2>&1 || true
+    tar -cf - -C "$PLUGIN_DIR" $FILES 2>/dev/null | "$ADB" $ADB_ARGS shell "run-as $PKG sh -c 'cd $DEST && tar -xf -'" >/dev/null 2>&1 || true
 }
 
 verify_plugin() {
     DEST=$1
     FAIL=0
     for f in $FILES; do
-        L=$(md5_of "$f")
+        L=$(md5_of "$PLUGIN_DIR/$f")
         R=$("$ADB" $ADB_ARGS shell "run-as $PKG md5sum $DEST/$f" | tr -d '\r' | cut -d' ' -f1)
         if [ -n "$R" ] && [ "$L" = "$R" ]; then
             echo "  ok $f"

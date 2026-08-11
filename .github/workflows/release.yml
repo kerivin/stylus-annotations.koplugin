@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: # Allows manual triggering from the Actions tab
+
+jobs:
+  build:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify plugin structure
+        run: |
+          test -f stylus-annotations.koplugin/main.lua || { echo "main.lua missing"; exit 1; }
+          test -f stylus-annotations.koplugin/_meta.lua || { echo "_meta.lua missing"; exit 1; }
+
+      - name: Package plugin
+        run: |
+          zip -r stylus-annotations.koplugin.zip stylus-annotations.koplugin -x "*.git*" "*/.*"
+          unzip -l stylus-annotations.koplugin.zip
+
+      - name: Create Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: stylus-annotations.koplugin.zip
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-beta') }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
