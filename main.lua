@@ -21,8 +21,14 @@ local T = require("ffi/util").template
 
 local Screen = Device.screen
 
-local function pointCoordToInt(v)
-    return tostring(math.floor(v * 4 + 0.5))
+local COORD_SCALE = 4
+
+local function pack(v)
+    return math.floor(v * COORD_SCALE + 0.5)
+end
+
+local function unpack(v)
+    return v / COORD_SCALE
 end
 
 local function stampDisc(bb, cx, cy, r, color)
@@ -1161,7 +1167,7 @@ function StylusAnnotations:saveStrokes()
         local pts = stroke.points
         local coords = {}
         for j = 1, #pts do
-            coords[#coords + 1] = pointCoordToInt(pts[j])
+            coords[#coords + 1] = tostring(pack(pts[j]))
         end
         out[#out + 1] = "{id=" .. string.format("%q", tostring(stroke.id))
         out[#out + 1] = ",page=" .. tostring(stroke.page)
@@ -1203,7 +1209,7 @@ function StylusAnnotations:loadStrokes()
         for _, stroke in ipairs(data.strokes) do
             local pts = stroke.points
             for i = 1, #pts do
-                pts[i] = pts[i] / 4
+                pts[i] = unpack(pts[i])
             end
             stroke.alpha = stroke.alpha or 1.0
             stroke.zoom = stroke.zoom or 1
