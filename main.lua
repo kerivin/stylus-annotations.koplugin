@@ -21,6 +21,10 @@ local T = require("ffi/util").template
 
 local Screen = Device.screen
 
+local function pointCoordToInt(v)
+    return tostring(math.floor(v * 4 + 0.5))
+end
+
 local function stampDisc(bb, cx, cy, r, color)
     local r2 = r * r
     local cyi = math.floor(cy)
@@ -1135,6 +1139,14 @@ function StylusAnnotations:saveStrokes()
         logger.warn("StylusAnnotations: no sidecar dir available, skipping save")
         return
     end
+    local strokes = self.strokes
+    if #strokes == 0 then
+        if lfs.attributes(filepath, "mode") == "file" then
+            os.remove(filepath)
+            logger.info("StylusAnnotations: no strokes, removed", filepath)
+        end
+        return
+    end
     local sidecar_dir = self.ui.doc_settings.doc_sidecar_dir
     if sidecar_dir then
         local ok, err = lfs.mkdir(sidecar_dir)
@@ -1142,11 +1154,36 @@ function StylusAnnotations:saveStrokes()
             logger.warn("StylusAnnotations: failed to create sidecar dir:", err)
         end
     end
-    local data = { version = STORAGE_VERSION, strokes = self.strokes }
+    local out = { "return {", tostring(STORAGE_VERSION), ",strokes={" }
+    for i = 1, #strokes do
+        local stroke = strokes[i]
+        if i > 1 then out[#out + 1] = "," end
+        local pts = stroke.points
+        local coords = {}
+        for j = 1, #pts do
+            coords[#coords + 1] = pointCoordToInt(pts[j])
+        end
+        out[#out + 1] = "{id=" .. string.format("%q", tostring(stroke.id))
+        out[#out + 1] = ",page=" .. tostring(stroke.page)
+        out[#out + 1] = ",points={" .. table.concat(coords, ",") .. "}"
+        out[#out + 1] = ",width=" .. tostring(stroke.width)
+        out[#out + 1] = ",color=" .. string.format("%q", stroke.color)
+        if (stroke.zoom or 1) ~= 1 then
+            out[#out + 1] = ",zoom=" .. tostring(stroke.zoom or 1)
+        end
+        if (stroke.alpha or 1) ~= 1 then
+            out[#out + 1] = ",alpha=" .. tostring(stroke.alpha or 1)
+        end
+        out[#out + 1] = ",datetime=" .. tostring(stroke.datetime or 0)
+        out[#out + 1] = "}"
+    end
+    out[#out + 1] = "}}\n"
+
     local f, err = io.open(filepath, "w")
     if f then
-        f:write("return " .. require("dump")(data))
+        f:write(table.concat(out))
         f:close()
+        logger.info("StylusAnnotations: saved", #strokes, "strokes")
     else
         logger.err("StylusAnnotations: failed to write strokes:", err)
     end
@@ -1163,17 +1200,25 @@ function StylusAnnotations:loadStrokes()
     local ok, data = pcall(dofile, filepath)
     if ok and data and data.strokes then
         local saved_version = self:migrateStrokes(data)
+        for _, stroke in ipairs(data.strokes) do
+            local pts = stroke.points
+            for i = 1, #pts do
+                pts[i] = pts[i] / 4
+            end
+            stroke.alpha = stroke.alpha or 1.0
+            stroke.zoom = stroke.zoom or 1
+        end
         self.strokes = data.strokes
         self:rebuildPageIndex()
         logger.info("StylusAnnotations: loaded", #self.strokes, "strokes from", filepath)
-        if saved_version and saved_version ~= STORAGE_VERSION then
+        if saved_version ~= STORAGE_VERSION then
             self:scheduleSave()
         end
     end
 end
 
 function StylusAnnotations:migrateStrokes(data)
-    local version = data.version or 0
+    local version = data.version or STORAGE_VERSION
     if version > STORAGE_VERSION then
         logger.warn("StylusAnnotations: sidecar version", version,
             "newer than supported", STORAGE_VERSION, "; attempting to load anyway")
@@ -1186,19 +1231,7 @@ function StylusAnnotations:migrateStrokes(data)
 end
 
 function StylusAnnotations:upgradeStrokesVersion(data, from)
-    if from == 0 then
-        for _, stroke in ipairs(data.strokes or {}) do
-            local pts = stroke and stroke.points
-            if pts and #pts > 0 and type(pts[1]) == "table" then
-                local flat = {}
-                for i = 1, #pts do
-                    flat[#flat + 1] = pts[i].x
-                    flat[#flat + 1] = pts[i].y
-                end
-                stroke.points = flat
-            end
-        end
-    end
+    if from == STORAGE_VERSION then return end
 end
 
 function StylusAnnotations:onStylusAnnotationsToggle()
