@@ -1,10 +1,9 @@
-local Geometry = require("core/geometry")
 local Base = require("lib/adapters/base")
 
 local Paged = {}
 
-function Paged:new(plugin, ui)
-    local o = Base:new(plugin, ui)
+function Paged:new(plugin)
+    local o = Base:new(plugin)
     return setmetatable(o, { __index = Paged })
 end
 
@@ -114,12 +113,7 @@ function Paged:forEachVisibleStroke(fn)
 end
 
 function Paged:serializeStroke(stroke)
-    local pts = stroke.points
-    local coords = {}
-    for i = 1, #pts do
-        coords[#coords + 1] = tostring(Geometry.pack(pts[i]))
-    end
-    return "page=" .. tostring(stroke.page) .. ",points={" .. table.concat(coords, ",") .. "}"
+    return "page=" .. tostring(stroke.page) .. "," .. self:packPoints(stroke.points)
 end
 
 function Paged:deserializeStroke(data)
@@ -133,22 +127,9 @@ function Paged:deserializeStroke(data)
         datetime = data.datetime or 0,
         page = data.page,
     }
-    local pts = data.points
-    if not pts or type(pts[1]) == "table" then return nil end
-    stroke.points = {}
-    for i = 1, #pts do
-        local v = pts[i]
-        if type(v) == "table" then
-            stroke.points[i] = Geometry.unpack(v[1])
-        else
-            stroke.points[i] = Geometry.unpack(v)
-        end
-    end
+    stroke.points = self:unpackPoints(data.points)
+    if not stroke.points then return nil end
     return stroke
-end
-
-function Paged:isPaged()
-    return true
 end
 
 setmetatable(Paged, { __index = Base })

@@ -1,5 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
+local Geometry = require("core/geometry")
 local Draw = require("lib/draw")
 
 local Screen = Device.screen
@@ -19,6 +20,28 @@ end
 
 function Base:getStrokeScreenWidth(stroke)
     return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
+end
+
+function Base:packPoints(points)
+    local coords = {}
+    for i = 1, #points do
+        coords[#coords + 1] = tostring(Geometry.pack(points[i]))
+    end
+    return "points={" .. table.concat(coords, ",") .. "}"
+end
+
+function Base:unpackPoints(pts)
+    if not pts or type(pts[1]) == "table" then return nil end
+    local points = {}
+    for i = 1, #pts do
+        local v = pts[i]
+        if type(v) == "table" then
+            points[i] = Geometry.unpack(v[1])
+        else
+            points[i] = Geometry.unpack(v)
+        end
+    end
+    return points
 end
 
 function Base:getPageZoom(page)
@@ -52,15 +75,7 @@ function Base:renderStrokeToScreen(stroke)
     self:paintStroke(Screen.bb, 0, 0, stroke)
 end
 
-function Base:paintTo(bb, x, y)
-    self:forEachVisibleStroke(function(stroke)
-        self:paintStroke(bb, x, y, stroke)
-    end)
-    local current = self.plugin.current_stroke
-    if current then
-        self:paintStroke(bb, x, y, current)
-    end
-
+function Base:paintSelection(bb, x, y)
     local selected = self.plugin.selected_strokes
     for _, stroke in ipairs(selected) do
         local rx, ry, rw, rh = self.plugin.store:getSelectionRect(stroke, bb:getWidth(), bb:getHeight())
@@ -71,6 +86,17 @@ function Base:paintTo(bb, x, y)
     for _, stroke in ipairs(selected) do
         self:paintStrokeSolid(bb, x, y, stroke, SELECTION_WHITE)
     end
+end
+
+function Base:paintTo(bb, x, y)
+    self:forEachVisibleStroke(function(stroke)
+        self:paintStroke(bb, x, y, stroke)
+    end)
+    local current = self.plugin.current_stroke
+    if current then
+        self:paintStroke(bb, x, y, current)
+    end
+    self:paintSelection(bb, x, y)
 end
 
 return Base

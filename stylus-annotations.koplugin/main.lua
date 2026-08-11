@@ -24,8 +24,6 @@ local T = require("ffi/util").template
 
 local Screen = Device.screen
 
-local SELECTION_WHITE = Blitbuffer.ColorRGB32(0xFF, 0xFF, 0xFF, 0xFF)
-
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
 
 local SAVE_DELAY_MS = 800
@@ -233,7 +231,6 @@ function StylusAnnotations:onPenPan(ges)
             self:addStrokePoint(cur.x, cur.y)
         end
     end
-    self.pen_x, self.pen_y = cur.x, cur.y
     return true
 end
 
@@ -268,7 +265,6 @@ function StylusAnnotations:onStylusEvent(input, slot)
         else
             self:startStroke(x, y)
         end
-        self.pen_x, self.pen_y = x, y
     else
 
         if self.current_stroke then
@@ -368,7 +364,7 @@ function StylusAnnotations:flushLiveStroke(stroke)
     local ld = self.live_dirty
     if not ld or ld.w <= 0 or ld.h <= 0 then return end
     local bb = Screen.bb
-    local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
+    local x0, y0, x1, y1 = self.store:getStrokeScreenBox(stroke)
     if not x0 then return end
     local pad = math.ceil(self:getStrokeScreenWidth(stroke) / 2)
     x0 = math.max(0, math.floor(x0 - pad))
@@ -438,10 +434,6 @@ function StylusAnnotations:scheduleRefresh()
     UIManager:scheduleIn(LIVE_REFRESH_DELAY_S, refresh_timer)
 end
 
-function StylusAnnotations:decimatePoints(stroke)
-    return self.store:decimatePoints(stroke)
-end
-
 function StylusAnnotations:renderStrokeToScreen(stroke)
     self.adapter:renderStrokeToScreen(stroke)
 end
@@ -488,18 +480,6 @@ function StylusAnnotations:getStrokeScreenWidth(stroke)
     return self.adapter:getStrokeScreenWidth(stroke)
 end
 
-function StylusAnnotations:colorDisplayName(name)
-    return Draw.colorDisplayName(name)
-end
-
-function StylusAnnotations:getPaletteColor(name)
-    return Draw.getPaletteColor(name, self.ui.highlight)
-end
-
-function StylusAnnotations:getRenderColor(stroke)
-    return Draw.getRenderColor(stroke, self.ui.highlight)
-end
-
 function StylusAnnotations:accumulateDirty(x, y, w, h)
     self.dirty_region = Geometry.mergeRect(self.dirty_region, x, y, w, h)
 end
@@ -514,10 +494,6 @@ end
 
 function StylusAnnotations:getPageZoom(page)
     return self.adapter:getPageZoom(page)
-end
-
-function StylusAnnotations:getStrokeScreenBox(stroke)
-    return self.store:getStrokeScreenBox(stroke)
 end
 
 function StylusAnnotations:getSelectionRect(stroke, width, height)
@@ -594,12 +570,8 @@ function StylusAnnotations:onStrokeHold(ges)
 
         return false
     end
-    self:showStrokeMenu(self:selectStrokesChain(stroke))
+    self:showStrokeMenu(self.store:selectStrokesChain(stroke))
     return true
-end
-
-function StylusAnnotations:selectStrokesChain(stroke)
-    return self.store:selectStrokesChain(stroke)
 end
 
 function StylusAnnotations:findStrokeAt(ges)
@@ -658,16 +630,7 @@ function StylusAnnotations:grabSelectionBackup()
 end
 
 function StylusAnnotations:paintSelectionToScreen()
-    local width, height = Screen:getWidth(), Screen:getHeight()
-    for _, stroke in ipairs(self.selected_strokes) do
-        local rx, ry, rw, rh = self:getSelectionRect(stroke, width, height)
-        if rx then
-            Screen.bb:paintRect(rx, ry, rw, rh, Blitbuffer.COLOR_BLACK)
-        end
-    end
-    for _, stroke in ipairs(self.selected_strokes) do
-        self:paintStrokeSolid(Screen.bb, 0, 0, stroke, SELECTION_WHITE)
-    end
+    self.adapter:paintSelection(Screen.bb, 0, 0)
     self:refreshRegion()
 end
 
@@ -683,17 +646,13 @@ function StylusAnnotations:restoreSelectionBackup()
     end
 end
 
-function StylusAnnotations:getSelectionUnionBox(strokes)
-    return self.store:getSelectionUnionBox(strokes)
-end
-
 function StylusAnnotations:showStrokeMenu(strokes)
     self:setSelection(strokes)
     local dialog
     dialog = ButtonDialog:new{
         width_factor = 0.45,
         anchor = function()
-            local x0, y0, x1, y1 = self:getSelectionUnionBox(strokes)
+            local x0, y0, x1, y1 = self.store:getSelectionUnionBox(strokes)
             if not x0 then return end
             local pad = math.max(4, math.floor(strokes[1].width * (strokes[1].zoom or 1)) + 2)
             return { x = x0 - pad, y = y0 - pad, w = (x1 - x0) + 2 * pad, h = (y1 - y0) + 2 * pad }
@@ -752,7 +711,7 @@ function StylusAnnotations:showColorPicker(current, apply)
     local values = {}
     local palette = Draw.getColorPalette()
     for i, c in ipairs(palette) do
-        values[i] = { c[1], c[2], self:getPaletteColor(c[2]) }
+        values[i] = { c[1], c[2], Draw.getPaletteColor(c[2], self.ui.highlight) }
     end
     local selector
     selector = ButtonSelector:new{
@@ -810,10 +769,6 @@ function StylusAnnotations:notifyStrokeDeleted(count)
         text = text,
         timeout = 2,
     })
-end
-
-function StylusAnnotations:rebuildPageIndex()
-    self.store:rebuildPageIndex()
 end
 
 function StylusAnnotations:getStrokesFilePath()
@@ -911,7 +866,7 @@ function StylusAnnotations:addToMainMenu(menu_items)
             },
             {
                 text_func = function()
-                    return T(_("Color: %1"), self:colorDisplayName(self.color))
+                    return T(_("Color: %1"), Draw.colorDisplayName(self.color))
                 end,
                 callback = function()
                     self:choosePenColor()

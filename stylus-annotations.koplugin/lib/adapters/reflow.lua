@@ -1,13 +1,12 @@
 local Device = require("device")
-local Geometry = require("core/geometry")
 local Base = require("lib/adapters/base")
 
 local Screen = Device.screen
 
 local Reflow = {}
 
-function Reflow:new(plugin, ui)
-    local o = Base:new(plugin, ui)
+function Reflow:new(plugin)
+    local o = Base:new(plugin)
     return setmetatable(o, { __index = Reflow })
 end
 
@@ -94,19 +93,10 @@ function Reflow:getZoom(page)
     return Screen:scaleBySize(1)
 end
 
-function Reflow:isPaged()
-    return false
-end
-
 function Reflow:serializeStroke(stroke)
-    local pts = stroke.points
-    local coords = {}
-    for i = 1, #pts do
-        coords[#coords + 1] = tostring(Geometry.pack(pts[i]))
-    end
     return "anchor0=" .. string.format("%q", stroke.anchor.pos0)
         .. ",anchor1=" .. string.format("%q", stroke.anchor.pos1)
-        .. ",points={" .. table.concat(coords, ",") .. "}"
+        .. "," .. self:packPoints(stroke.points)
 end
 
 function Reflow:deserializeStroke(data)
@@ -120,17 +110,8 @@ function Reflow:deserializeStroke(data)
         datetime = data.datetime or 0,
         anchor = { pos0 = data.anchor0, pos1 = data.anchor1 },
     }
-    local pts = data.points
-    if not pts or type(pts[1]) == "table" then return nil end
-    stroke.points = {}
-    for i = 1, #pts do
-        local v = pts[i]
-        if type(v) == "table" then
-            stroke.points[i] = Geometry.unpack(v[1])
-        else
-            stroke.points[i] = Geometry.unpack(v)
-        end
-    end
+    stroke.points = self:unpackPoints(data.points)
+    if not stroke.points then return nil end
     stroke.page = self:getDoc():getPageFromXPointer(stroke.anchor.pos0)
     return stroke
 end

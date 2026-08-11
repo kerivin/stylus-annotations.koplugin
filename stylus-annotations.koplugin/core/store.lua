@@ -24,10 +24,6 @@ function StrokeStore:new(mapper, logger)
     return setmetatable(o, { __index = StrokeStore })
 end
 
-function StrokeStore:getStrokeScreenWidth(stroke)
-    return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
-end
-
 function StrokeStore:add(stroke)
     table.insert(self.strokes, stroke)
     if stroke.page then
@@ -167,7 +163,7 @@ function StrokeStore:decimatePoints(stroke)
 
     local num_kept = math.floor(#kept / 2)
     if num_kept <= 3 then return kept end
-    local tol = math.min(3.0, math.max(0.75, self:getStrokeScreenWidth(stroke) / 4))
+    local tol = math.min(3.0, math.max(0.75, self.mapper:getStrokeScreenWidth(stroke) / 4))
     local idx = Geometry.rdpSimplifyIndices(kept_s, tol)
     if #idx == num_kept then return kept end
     local out = {}
@@ -289,15 +285,8 @@ function StrokeStore:migrateStrokes(data)
         self.logger.warn("StrokeStore: sidecar version", version,
             "newer than supported", StrokeStore.STORAGE_VERSION, "; attempting to load anyway")
     end
-    for v = version, StrokeStore.STORAGE_VERSION - 1 do
-        self:upgradeStrokesVersion(data, v)
-    end
     data.version = StrokeStore.STORAGE_VERSION
     return version
-end
-
-function StrokeStore:upgradeStrokesVersion(data, from)
-    if from == StrokeStore.STORAGE_VERSION then return end
 end
 
 return StrokeStore
