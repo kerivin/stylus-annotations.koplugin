@@ -3,9 +3,12 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Geometry = require("lib/geometry")
+local Draw = require("lib/draw")
+local PagedAdapter = require("lib/adapters/paged")
+local ReflowAdapter = require("lib/adapters/reflow")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local ReaderHighlight = require("apps/reader/modules/readerhighlight")
+local Event = require("ui/event")
 local ButtonDialog = require("ui/widget/buttondialog")
 local ButtonSelector = require("ui/widget/buttonselector")
 local InputDialog = require("ui/widget/inputdialog")
@@ -21,53 +24,10 @@ local T = require("ffi/util").template
 
 local Screen = Device.screen
 
-local COORD_SCALE = 4
-
-local function pack(v)
-    return math.floor(v * COORD_SCALE + 0.5)
-end
-
-local function unpack(v)
-    return v / COORD_SCALE
-end
-
-local function stampDisc(bb, cx, cy, r, color)
-    local r2 = r * r
-    local cyi = math.floor(cy)
-    for dy = -math.floor(r), math.floor(r) do
-        local span = math.floor(math.sqrt(r2 - dy * dy) + 0.5)
-        if span > 0 then
-            bb:paintRectRGB32(math.floor(cx) - span, cyi + dy, 2 * span + 1, 1, color)
-        end
-    end
-end
-
-local function stampPath(bb, pts, ox, oy, r, color)
-    local n = #pts
-    if n == 0 then return end
-    local px, py = pts[1].x, pts[1].y
-    stampDisc(bb, ox + px, oy + py, r, color)
-    for i = 2, n do
-        local nx, ny = pts[i].x, pts[i].y
-        local dx, dy = nx - px, ny - py
-        local dist_sq = dx * dx + dy * dy
-        if dist_sq >= 1 then
-            local steps = math.ceil(math.sqrt(dist_sq))
-            for s = 1, steps do
-                stampDisc(bb, ox + px + dx * (s / steps), oy + py + dy * (s / steps), r, color)
-            end
-        else
-            stampDisc(bb, ox + nx, oy + ny, r, color)
-        end
-        px, py = nx, ny
-    end
-end
-
 local SELECTION_WHITE = Blitbuffer.ColorRGB32(0xFF, 0xFF, 0xFF, 0xFF)
 
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
 
-local HIT_TEST_THRESHOLD_PX = 25
 local SAVE_DELAY_MS = 800
 local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
@@ -109,41 +69,9 @@ local WidthPreview = Widget:extend{
                 y = y + pad + PREVIEW_POINTS[i][2] / 100 * draw_h,
             }
         end
-        stampPath(bb, pts, 0, 0, w / 2, Blitbuffer.COLOR_BLACK)
+        Draw.stampPath(bb, pts, 0, 0, w / 2, Blitbuffer.COLOR_BLACK)
     end,
 }
-
-local EXTRA_COLORS = {
-    {_("Black"), "black", "#000000"},
-    {_("White"), "white", "#FFFFFF"},
-}
-
-local EXTRA_COLOR_NAMES = {}
-for _, c in ipairs(EXTRA_COLORS) do
-    EXTRA_COLOR_NAMES[c[2]] = true
-end
-
-local COLOR_PALETTE = {}
-for _, c in ipairs(ReaderHighlight.highlight_colors) do
-    COLOR_PALETTE[#COLOR_PALETTE + 1] = { c[1], c[2] }
-end
-for _, c in ipairs(EXTRA_COLORS) do
-    COLOR_PALETTE[#COLOR_PALETTE + 1] = { c[1], c[2] }
-end
-
-local COLOR_HEX = {}
-for name, hex in pairs(Blitbuffer.HIGHLIGHT_COLORS) do
-    COLOR_HEX[name] = hex
-end
-COLOR_HEX.gray = "#808080"
-for _, c in ipairs(EXTRA_COLORS) do
-    COLOR_HEX[c[2]] = c[3]
-end
-
-local COLOR_DISPLAY_NAMES = {}
-for _, c in ipairs(COLOR_PALETTE) do
-    COLOR_DISPLAY_NAMES[c[2]] = c[1]
-end
 
 local StylusAnnotations = InputContainer:extend{
     name = "stylus_annotations",
@@ -177,12 +105,13 @@ function StylusAnnotations:init()
     self.strokes_by_page = {}
     self.stroke_id_counter = 0
 
+    self.view = self.ui.view
+
+    self.adapter = (self.ui.paging and PagedAdapter:new(self) or ReflowAdapter:new(self))
+
     self:loadSettings()
 
-    self.view = self.ui.view
     self.view:registerViewModule("stylus_annotations", self)
-
-    self:loadStrokes()
 
     self.ui.menu:registerToMainMenu(self)
 
@@ -199,6 +128,11 @@ function StylusAnnotations:init()
     dbg:turnOff()
 
     logger.info("StylusAnnotations: initialized, strokes =", #self.strokes)
+end
+
+function StylusAnnotations:onReaderReady()
+    self:loadStrokes()
+    self.ui:handleEvent(Event:new("UpdatePos"))
 end
 
 function StylusAnnotations:isEnabled()
@@ -350,18 +284,19 @@ function StylusAnnotations:onStylusEvent(input, slot)
 end
 
 function StylusAnnotations:startStroke(x, y)
-    local pos = self.ui.view:screenToPageTransform({ x = x, y = y })
     self.stroke_id_counter = self.stroke_id_counter + 1
-    self.current_stroke = {
+    local stroke = {
         id = tostring(self.stroke_id_counter),
-        page = pos.page,
-        points = { pos.x, pos.y },
         width = self.width,
         color = self.color,
         alpha = 1.0,
-        zoom = pos.zoom or 1,
         datetime = os.time(),
     }
+    if not self.adapter:initStroke(stroke, x, y) then
+        self.stroke_id_counter = self.stroke_id_counter - 1
+        return
+    end
+    self.current_stroke = stroke
     self.pen_x, self.pen_y = x, y
     self.dirty_region = nil
 
@@ -395,12 +330,7 @@ end
 function StylusAnnotations:addStrokePoint(x, y)
     local stroke = self.current_stroke
     if not stroke then return end
-    local pos = self.ui.view:screenToPageTransform({ x = x, y = y })
-    if pos.page ~= stroke.page then return end
-    local pts = stroke.points
-    local m = #pts
-    if m >= 2 and pts[m - 1] == pos.x and pts[m] == pos.y then return end
-    pts[m + 1], pts[m + 2] = pos.x, pos.y
+    if not self.adapter:addPoint(stroke, x, y) then return end
 
     local sw = self:getStrokeScreenWidth(stroke)
     local half = math.floor(sw / 2)
@@ -482,7 +412,7 @@ function StylusAnnotations:endStroke()
     self.dirty_region = nil
     if not stroke or #stroke.points == 0 then return end
 
-    stroke.points = self:decimatePoints(stroke)
+    stroke.points = self.adapter:decimatePoints(stroke)
 
     table.insert(self.strokes, stroke)
     local idx = #self.strokes
@@ -516,43 +446,11 @@ function StylusAnnotations:scheduleRefresh()
 end
 
 function StylusAnnotations:decimatePoints(stroke)
-    local pts = stroke.points
-    local num = math.floor(#pts / 2)
-    if num <= 2 then return pts end
-    local MIN_SPACING = 2.0
-    local kept = { pts[1], pts[2] }
-    local kept_s = { self:pageToScreenPoint(stroke.page, pts[1], pts[2]) }
-    local lx, ly = kept_s[1], kept_s[2]
-    for i = 2, num - 1 do
-        local xi, yi = pts[2 * i - 1], pts[2 * i]
-        local sx, sy = self:pageToScreenPoint(stroke.page, xi, yi)
-        local dx, dy = sx - lx, sy - ly
-        if dx * dx + dy * dy >= MIN_SPACING * MIN_SPACING then
-            kept[#kept + 1], kept[#kept + 2] = xi, yi
-            kept_s[#kept_s + 1], kept_s[#kept_s + 2] = sx, sy
-            lx, ly = sx, sy
-        end
-    end
-    kept[#kept + 1], kept[#kept + 2] = pts[#pts - 1], pts[#pts]
-    local lx2, ly2 = self:pageToScreenPoint(stroke.page, pts[#pts - 1], pts[#pts])
-    kept_s[#kept_s + 1], kept_s[#kept_s + 2] = lx2, ly2
-
-    local num_kept = math.floor(#kept / 2)
-    if num_kept <= 3 then return kept end
-    local tol = math.min(3.0, math.max(0.75, self:getStrokeScreenWidth(stroke) / 4))
-    local idx = Geometry.rdpSimplifyIndices(kept_s, tol)
-    if #idx == num_kept then return kept end
-    local out = {}
-    for p = 1, #idx do
-        local k = idx[p]
-        out[#out + 1] = kept[2 * k - 1]
-        out[#out + 1] = kept[2 * k]
-    end
-    return out
+    return self.adapter:decimatePoints(stroke)
 end
 
 function StylusAnnotations:renderStrokeToScreen(stroke)
-    self:paintStroke(Screen.bb, 0, 0, stroke)
+    self.adapter:renderStrokeToScreen(stroke)
 end
 
 function StylusAnnotations:refreshRegion(region)
@@ -588,32 +486,25 @@ function StylusAnnotations:onStrokeCancel()
 end
 
 function StylusAnnotations:showStrokeMenuAt(x, y)
-    local stroke = self:findStrokeAt({ pos = { x = x, y = y } })
+    local stroke = self.adapter:findStrokeAt(x, y)
     if not stroke then return end
     self:showStrokeMenu({ stroke })
 end
 
 function StylusAnnotations:getStrokeScreenWidth(stroke)
-    return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
+    return self.adapter:getStrokeScreenWidth(stroke)
 end
 
 function StylusAnnotations:colorDisplayName(name)
-    return COLOR_DISPLAY_NAMES[name] or name
+    return Draw.colorDisplayName(name)
 end
 
 function StylusAnnotations:getPaletteColor(name)
-    if self.ui.highlight and not EXTRA_COLOR_NAMES[name] then
-        return self.ui.highlight:getHighlightColor(name, nil, Screen.night_mode)
-    end
-    local hex = COLOR_HEX[name]
-    return hex and Blitbuffer.colorFromString(hex) or Blitbuffer.COLOR_BLACK
+    return Draw.getPaletteColor(name, self.ui.highlight)
 end
 
 function StylusAnnotations:getRenderColor(stroke)
-    local color = self:getPaletteColor(stroke.color)
-    local rgb = color:getColorRGB32()
-    local alpha = math.floor((stroke.alpha or 1.0) * 255)
-    return Blitbuffer.ColorRGB32(rgb.r, rgb.g, rgb.b, alpha)
+    return Draw.getRenderColor(stroke, self.ui.highlight)
 end
 
 function StylusAnnotations:accumulateDirty(x, y, w, h)
@@ -621,156 +512,27 @@ function StylusAnnotations:accumulateDirty(x, y, w, h)
 end
 
 function StylusAnnotations:paintTo(bb, x, y)
-    if not self.ui.paging then return end
-    local pages = self:getVisiblePages()
-    if not pages then return end
-    for _, page in ipairs(pages) do
-        for _, idx in ipairs(self.strokes_by_page[page] or {}) do
-            self:paintStroke(bb, x, y, self.strokes[idx])
-        end
-    end
-    if self.current_stroke then
-        self:paintStroke(bb, x, y, self.current_stroke)
-    end
-
-    for _, stroke in ipairs(self.selected_strokes) do
-        local rx, ry, rw, rh = self:getSelectionRect(stroke, bb:getWidth(), bb:getHeight())
-        if rx then
-            bb:paintRect(rx, ry, rw, rh, Blitbuffer.COLOR_BLACK)
-        end
-    end
-    for _, stroke in ipairs(self.selected_strokes) do
-        self:paintStrokeSolid(bb, x, y, stroke, SELECTION_WHITE)
-    end
+    self.adapter:paintTo(bb, x, y)
 end
 
 function StylusAnnotations:getVisiblePages()
-    local view = self.view
-    if view.page_scroll then
-        local pages = {}
-        for _, state in ipairs(view.page_states) do
-            pages[#pages + 1] = state.page
-        end
-        return pages
-    else
-        if not view.state or not view.state.page then return nil end
-        return { view.state.page }
-    end
-end
-
-function StylusAnnotations:paintStroke(bb, x, y, stroke)
-    local color = self:getRenderColor(stroke)
-    local sw = self:getPageZoom(stroke.page) * stroke.width
-    local pts = stroke.points
-    local m = #pts
-    if m == 0 then return end
-    local sph = {}
-    for i = 1, m, 2 do
-        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i], pts[i + 1])
-        if not sx then return end
-        sph[#sph + 1] = { x = x + sx, y = y + sy }
-    end
-    self:drawStrokePath(bb, sph, sw, color)
-end
-
-function StylusAnnotations:getStrokeScreenBox(stroke)
-    local pts = stroke.points
-    local m = #pts
-    if m == 0 then return end
-    local spts = {}
-    for i = 1, m, 2 do
-        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i], pts[i + 1])
-        if not sx then return end
-        spts[#spts + 1], spts[#spts + 2] = sx, sy
-    end
-    return Geometry.screenBounds(spts)
-end
-
-function StylusAnnotations:getSelectionRect(stroke, width, height)
-    local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
-    if not x0 then return end
-    local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
-    return Geometry.clampRect(x0 - pad, y0 - pad, (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad, width, height)
-end
-
-function StylusAnnotations:paintStrokeSolid(bb, x, y, stroke, color)
-    local sw = self:getPageZoom(stroke.page) * stroke.width
-    local pts = stroke.points
-    local m = #pts
-    if m == 0 then return end
-    local sph = {}
-    for i = 1, m, 2 do
-        local sx, sy = self:pageToScreenPoint(stroke.page, pts[i], pts[i + 1])
-        if not sx then return end
-        sph[#sph + 1] = { x = x + sx, y = y + sy }
-    end
-    stampPath(bb, sph, 0, 0, sw / 2, color)
-end
-
-function StylusAnnotations:drawStrokePath(bb, sph, sw, color)
-    local n = #sph
-    if n == 0 then return end
-    local half = math.floor(sw / 2)
-    local min_x, min_y, max_x, max_y = Geometry.pointsBounds(sph)
-    local box_x = math.max(0, math.floor(min_x - half))
-    local box_y = math.max(0, math.floor(min_y - half))
-    local box_w = math.ceil(max_x + half) - box_x
-    local box_h = math.ceil(max_y + half) - box_y
-    if box_w <= 0 or box_h <= 0 then return end
-    box_w = math.min(bb:getWidth() - box_x, box_w)
-    box_h = math.min(bb:getHeight() - box_y, box_h)
-    if box_w <= 0 or box_h <= 0 then return end
-
-    local mask = Blitbuffer.new(box_w, box_h, bb:getType())
-    if not mask then return end
-    mask:paintRect(0, 0, box_w, box_h, Blitbuffer.COLOR_WHITE)
-
-    stampPath(mask, sph, -box_x, -box_y, sw / 2, color)
-
-    if bb:getInverse() == 1 then
-        local rb = color:getColorRGB32()
-        local inv = Blitbuffer.ColorRGB32(rb.r, rb.g, rb.b, 0xFF):invert()
-        bb:blendRectRGB32(box_x, box_y, box_w, box_h, inv)
-    else
-        bb:blitFrom(mask, box_x, box_y, 0, 0, box_w, box_h, bb.setPixelMultiply)
-    end
-    mask:free()
+    return self.adapter:getVisiblePages()
 end
 
 function StylusAnnotations:getPageZoom(page)
-    local view = self.view
-    if view.page_scroll then
-        for _, state in ipairs(view.page_states) do
-            if state.page == page then
-                return state.zoom or 1
-            end
-        end
-        return 1
-    else
-        return view.state and view.state.zoom or 1
-    end
+    return self.adapter:getPageZoom(page)
 end
 
-function StylusAnnotations:pageToScreenPoint(page, x_p, y_p)
-    local view = self.view
-    if view.page_scroll then
-        local acc_y = 0
-        for _, state in ipairs(view.page_states) do
-            if state.page == page then
-                local sx = state.offset.x + x_p * state.zoom - state.visible_area.x
-                local sy = acc_y + state.offset.y + y_p * state.zoom - state.visible_area.y
-                return sx, sy
-            end
-            acc_y = acc_y + state.visible_area.h + view.page_gap.height
-        end
-        return nil
-    else
-        local st = view.state
-        if not st or st.page ~= page then return nil end
-        local sx = st.offset.x + x_p * st.zoom - view.visible_area.x
-        local sy = st.offset.y + y_p * st.zoom - view.visible_area.y
-        return sx, sy
-    end
+function StylusAnnotations:getStrokeScreenBox(stroke)
+    return self.adapter:getStrokeScreenBox(stroke)
+end
+
+function StylusAnnotations:getSelectionRect(stroke, width, height)
+    return self.adapter:getSelectionRect(stroke, width, height)
+end
+
+function StylusAnnotations:paintStrokeSolid(bb, x, y, stroke, color)
+    self.adapter:paintStrokeSolid(bb, x, y, stroke, color)
 end
 
 function StylusAnnotations:setupTouchZones()
@@ -844,39 +606,12 @@ function StylusAnnotations:onStrokeHold(ges)
 end
 
 function StylusAnnotations:selectStrokesChain(stroke)
-    local selection = { stroke }
-    local seen = { [stroke] = true }
-    local queue = { stroke }
-    local i = 1
-    while i <= #queue do
-        local cur = queue[i]
-        i = i + 1
-        for _, s in ipairs(self.strokes) do
-            if not seen[s] and s.page == cur.page and Geometry.strokesIntersect(cur, s) then
-                seen[s] = true
-                selection[#selection + 1] = s
-                queue[#queue + 1] = s
-            end
-        end
-    end
-    return selection
+    return self.adapter:selectStrokesChain(stroke)
 end
 
 function StylusAnnotations:findStrokeAt(ges)
     if #self.strokes == 0 or not ges or not ges.pos then return nil end
-    local pos = self.ui.view:screenToPageTransform({ x = ges.pos.x, y = ges.pos.y })
-    local zoom = pos.zoom or 1
-    local threshold = HIT_TEST_THRESHOLD_PX / zoom
-    local best, best_sq
-    for _, stroke in ipairs(self.strokes) do
-        if stroke.page == pos.page then
-            local d = Geometry.strokeDistanceSq(pos.x, pos.y, stroke)
-            if d <= threshold * threshold and (not best_sq or d < best_sq) then
-                best, best_sq = stroke, d
-            end
-        end
-    end
-    return best
+    return self.adapter:findStrokeAt(ges.pos.x, ges.pos.y)
 end
 
 function StylusAnnotations:selectionsEqual(a, b)
@@ -1032,7 +767,8 @@ end
 function StylusAnnotations:showColorPicker(current, apply)
 
     local values = {}
-    for i, c in ipairs(COLOR_PALETTE) do
+    local palette = Draw.getColorPalette()
+    for i, c in ipairs(palette) do
         values[i] = { c[1], c[2], self:getPaletteColor(c[2]) }
     end
     local selector
@@ -1112,11 +848,7 @@ function StylusAnnotations:notifyStrokeDeleted(count)
 end
 
 function StylusAnnotations:rebuildPageIndex()
-    self.strokes_by_page = {}
-    for i, stroke in ipairs(self.strokes) do
-        self.strokes_by_page[stroke.page] = self.strokes_by_page[stroke.page] or {}
-        table.insert(self.strokes_by_page[stroke.page], i)
-    end
+    self.adapter:rebuildPageIndex()
 end
 
 function StylusAnnotations:getStrokesFilePath()
@@ -1164,14 +896,8 @@ function StylusAnnotations:saveStrokes()
     for i = 1, #strokes do
         local stroke = strokes[i]
         if i > 1 then out[#out + 1] = "," end
-        local pts = stroke.points
-        local coords = {}
-        for j = 1, #pts do
-            coords[#coords + 1] = tostring(pack(pts[j]))
-        end
         out[#out + 1] = "{id=" .. string.format("%q", tostring(stroke.id))
-        out[#out + 1] = ",page=" .. tostring(stroke.page)
-        out[#out + 1] = ",points={" .. table.concat(coords, ",") .. "}"
+        out[#out + 1] = "," .. self.adapter:serializeStroke(stroke)
         out[#out + 1] = ",width=" .. tostring(stroke.width)
         out[#out + 1] = ",color=" .. string.format("%q", stroke.color)
         if (stroke.zoom or 1) ~= 1 then
@@ -1206,15 +932,14 @@ function StylusAnnotations:loadStrokes()
     local ok, data = pcall(dofile, filepath)
     if ok and data and data.strokes then
         local saved_version = self:migrateStrokes(data)
-        for _, stroke in ipairs(data.strokes) do
-            local pts = stroke.points
-            for i = 1, #pts do
-                pts[i] = unpack(pts[i])
+        local loaded = {}
+        for _, stroke_data in ipairs(data.strokes) do
+            local stroke = self.adapter:deserializeStroke(stroke_data)
+            if stroke then
+                loaded[#loaded + 1] = stroke
             end
-            stroke.alpha = stroke.alpha or 1.0
-            stroke.zoom = stroke.zoom or 1
         end
-        self.strokes = data.strokes
+        self.strokes = loaded
         self:rebuildPageIndex()
         logger.info("StylusAnnotations: loaded", #self.strokes, "strokes from", filepath)
         if saved_version ~= STORAGE_VERSION then

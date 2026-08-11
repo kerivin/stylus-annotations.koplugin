@@ -1,5 +1,15 @@
 local Geometry = {}
 
+local COORD_SCALE = 4
+
+function Geometry.pack(v)
+    return math.floor(v * COORD_SCALE + 0.5)
+end
+
+function Geometry.unpack(v)
+    return v / COORD_SCALE
+end
+
 local function pointSegmentDistanceSq(px, py, x1, y1, x2, y2)
     local dx, dy = x2 - x1, y2 - y1
     local len_sq = dx * dx + dy * dy
