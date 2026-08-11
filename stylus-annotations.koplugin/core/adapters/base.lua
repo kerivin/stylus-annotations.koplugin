@@ -1,7 +1,7 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
 local Geometry = require("core/geometry")
-local Draw = require("lib/draw")
+local Draw = require("core/draw")
 
 local Screen = Device.screen
 
@@ -42,6 +42,24 @@ function Base:unpackPoints(pts)
         end
     end
     return points
+end
+
+function Base:pointToScreen(stroke, x_p, y_p)
+    return x_p, y_p
+end
+
+function Base:paintSegment(bb, x, y, stroke, ax, ay, bx, by)
+    local p0x, p0y = self:pointToScreen(stroke, ax, ay)
+    if not p0x then return end
+    local p1x, p1y = self:pointToScreen(stroke, bx, by)
+    if not p1x then return end
+    local color = Draw.getRenderColor(stroke, self.ui.highlight)
+    local sw = self:getStrokeScreenWidth(stroke)
+    local sph = {
+        { x = x + p0x, y = y + p0y },
+        { x = x + p1x, y = y + p1y },
+    }
+    Draw.paintStrokePath(bb, sph, sw, color)
 end
 
 function Base:getPageZoom(page)

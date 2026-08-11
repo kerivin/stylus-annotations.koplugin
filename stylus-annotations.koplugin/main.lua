@@ -3,9 +3,9 @@ local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Geometry = require("core/geometry")
-local Draw = require("lib/draw")
-local PagedAdapter = require("lib/adapters/paged")
-local ReflowAdapter = require("lib/adapters/reflow")
+local Draw = require("core/draw")
+local PagedAdapter = require("core/adapters/paged")
+local ReflowAdapter = require("core/adapters/reflow")
 local StrokeStore = require("core/store")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
@@ -19,6 +19,8 @@ local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local dbg = require("dbg")
+local util = require("util")
+local time = require("ui/time")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -29,7 +31,7 @@ local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
 local SAVE_DELAY_MS = 800
 local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
-local LIVE_REFRESH_DELAY_S = 0.7
+local LIVE_REFRESH_INTERVAL_MS = 33
 
 local DEFAULT_WIDTH = 2
 local DEFAULT_COLOR = "orange"
@@ -76,6 +78,7 @@ local StylusAnnotations = InputContainer:extend{
     store = nil,
 
     stylus_callback_registered = false,
+    touch_pen_fallback_registered = false,
     touch_zones_registered = false,
 
     current_stroke = nil,
@@ -91,7 +94,10 @@ local StylusAnnotations = InputContainer:extend{
     selection_backup_x = 0,
     selection_backup_y = 0,
     dirty_region = nil,
-    refresh_timer = nil,
+    live_ink = true,
+    live_snapshot = nil,
+    live_dirty = nil,
+    last_refresh_time = 0,
     pending_save = nil,
 }
 
@@ -117,6 +123,7 @@ function StylusAnnotations:init()
     })
 
     self:setupStylusCallback()
+    self:setupPenPanZones()
     self:setupTouchZones()
 
     dbg:turnOff()
@@ -139,7 +146,7 @@ end
 
 function StylusAnnotations:loadSettings()
     local ds = self.ui.doc_settings
-    self.live_ink = ds:readSetting("stylus_annotations_live_ink") == true
+    self.live_ink = ds:readSetting("stylus_annotations_live_ink") ~= false
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
     self.color = ds:readSetting("stylus_annotations_color") or DEFAULT_COLOR
 end
@@ -163,10 +170,6 @@ function StylusAnnotations:setupStylusCallback()
     else
         logger.warn("StylusAnnotations: stylus callback API not available")
     end
-
-    if Device:isEmulator() then
-        self:setupTouchPenFallback()
-    end
 end
 
 function StylusAnnotations:teardownStylusCallback()
@@ -178,7 +181,7 @@ function StylusAnnotations:teardownStylusCallback()
     self.stylus_callback_registered = false
 end
 
-function StylusAnnotations:setupTouchPenFallback()
+function StylusAnnotations:setupPenPanZones()
     if self.touch_pen_fallback_registered then return end
     self.ui:registerTouchZones({
         {
@@ -215,31 +218,38 @@ function StylusAnnotations:setupTouchPenFallback()
         },
     })
     self.touch_pen_fallback_registered = true
-    logger.info("StylusAnnotations: touch-pan pen fallback registered")
+    logger.info("StylusAnnotations: pen pan gesture zones registered")
 end
 
 function StylusAnnotations:onPenPan(ges)
+    if self.current_stroke then
+        if self.stylus_callback_registered then return true end
+        local cur = ges.pos
+        self:addStrokePoint(cur.x, cur.y)
+        return true
+    end
     if self:isOverlayActive() then return false end
     if not self:isEnabled() then return false end
+    if self.stylus_callback_registered then return true end
     local start = ges.start_pos or ges.pos
     local cur = ges.pos
+    self:startStroke(start.x, start.y)
     if self.current_stroke then
         self:addStrokePoint(cur.x, cur.y)
-    else
-        self:startStroke(start.x, start.y)
-        if self.current_stroke then
-            self:addStrokePoint(cur.x, cur.y)
-        end
     end
     return true
 end
 
 function StylusAnnotations:onPenPanRelease(ges)
+    if self.current_stroke then
+        if not self.stylus_callback_registered then
+            self:endStroke()
+        end
+        return true
+    end
     if self:isOverlayActive() then return false end
     if not self:isEnabled() then return false end
-    if self.current_stroke then
-        self:endStroke()
-    end
+    if self.stylus_callback_registered then return true end
     return true
 end
 
@@ -291,13 +301,8 @@ function StylusAnnotations:startStroke(x, y)
     self.current_stroke = stroke
     self.pen_x, self.pen_y = x, y
     self.dirty_region = nil
-
-    if self.refresh_timer then
-        UIManager:unschedule(self.refresh_timer)
-        self.refresh_timer = nil
-    end
-
     self.live_dirty = nil
+    self.last_refresh_time = time.now()
 
     if self.live_ink ~= false then
         if self.live_snapshot then
@@ -325,16 +330,16 @@ function StylusAnnotations:addStrokePoint(x, y)
     if not self.adapter:addPoint(stroke, x, y) then return end
 
     local sw = self:getStrokeScreenWidth(stroke)
-    local half = math.floor(sw / 2)
-    local seg_x = math.min(self.pen_x, x) - half
-    local seg_y = math.min(self.pen_y, y) - half
-    local seg_w = math.abs(x - self.pen_x) + sw
-    local seg_h = math.abs(y - self.pen_y) + sw
+    local pad = math.floor(sw / 2) + 1
+    local seg_x = math.min(self.pen_x, x) - pad
+    local seg_y = math.min(self.pen_y, y) - pad
+    local seg_w = math.abs(x - self.pen_x) + 2 * pad
+    local seg_h = math.abs(y - self.pen_y) + 2 * pad
     self:accumulateDirty(seg_x, seg_y, seg_w, seg_h)
 
     if self.live_ink ~= false then
         self.live_dirty = Geometry.mergeRect(self.live_dirty, seg_x, seg_y, seg_w, seg_h)
-        self:flushLiveStroke(stroke)
+        self:flushLiveThrottled()
     end
 
     self.pen_x, self.pen_y = x, y
@@ -347,50 +352,41 @@ function StylusAnnotations:addStrokePoint(x, y)
     end
 end
 
-function StylusAnnotations:flushLive()
+-- Live ink, throttled: erase the accumulated dirty rect from a clean snapshot
+-- taken at stroke start, repaint the whole in-progress stroke with the same
+-- renderer used for the final stroke (so color/blending are exact), then flush
+-- only that rect to the display with a direct Screen:refreshUI. No widget
+-- repaint happens per pen event, which is what kept live drawing laggy.
+function StylusAnnotations:flushLiveThrottled()
+    if self.live_ink == false or not self.live_snapshot then return end
     local ld = self.live_dirty
     if not ld or ld.w <= 0 or ld.h <= 0 then return end
+    local now = time.now()
+    if time.to_ms(now - self.last_refresh_time) < LIVE_REFRESH_INTERVAL_MS then return end
+    self.last_refresh_time = now
     self.live_dirty = nil
-    local rx, ry, rw, rh = Geometry.clampRect(
-        ld.x, ld.y, ld.w, ld.h, Screen:getWidth(), Screen:getHeight())
-    if rx then
-        UIManager:setDirty(self.view, function()
-            return "fast", Geom:new{x = rx, y = ry, w = rw, h = rh}
-        end)
-    end
+    self:flushLive(ld, self.current_stroke)
 end
 
-function StylusAnnotations:flushLiveStroke(stroke)
-    local ld = self.live_dirty
-    if not ld or ld.w <= 0 or ld.h <= 0 then return end
+function StylusAnnotations:flushLive(ld, stroke)
+    if not self.live_snapshot then return end
     local bb = Screen.bb
-    local x0, y0, x1, y1 = self.store:getStrokeScreenBox(stroke)
-    if not x0 then return end
-    local pad = math.ceil(self:getStrokeScreenWidth(stroke) / 2)
-    x0 = math.max(0, math.floor(x0 - pad))
-    y0 = math.max(0, math.floor(y0 - pad))
-    x1 = math.min(bb:getWidth() - 1, math.ceil(x1 + pad))
-    y1 = math.min(bb:getHeight() - 1, math.ceil(y1 + pad))
-    local rw = x1 - x0 + 1
-    local rh = y1 - y0 + 1
-    if self.live_snapshot then
-        bb:blitFrom(self.live_snapshot, x0, y0, x0, y0, rw, rh)
+    local rx, ry, rw, rh = Geometry.clampRect(
+        ld.x, ld.y, ld.w, ld.h, Screen:getWidth(), Screen:getHeight())
+    if not rx then return end
+    bb:blitFrom(self.live_snapshot, rx, ry, rx, ry, rw, rh)
+    if stroke then
+        self:renderStrokeToScreen(stroke)
     end
-    self.live_dirty = Geometry.mergeRect(ld, x0, y0, rw, rh)
-    self:renderStrokeToScreen(stroke)
-    self:flushLive()
+    Screen:refreshUI(rx, ry, rw, rh)
 end
 
 function StylusAnnotations:cancelLive()
-    self.live_dirty = nil
     if self.live_snapshot then
         self.live_snapshot:free()
         self.live_snapshot = nil
     end
-    if self.refresh_timer then
-        UIManager:unschedule(self.refresh_timer)
-        self.refresh_timer = nil
-    end
+    self.live_dirty = nil
 end
 
 function StylusAnnotations:endStroke()
@@ -410,28 +406,22 @@ function StylusAnnotations:endStroke()
 
     self:scheduleSave()
 
-    self:cancelLive()
-
+    -- Live ink already painted the buffer while the pen was down, so leave the
+    -- last live frame on screen and touch nothing on pen-up (a re-render would
+    -- re-blend the ink, and a partial refresh can't clear its fast-refresh
+    -- residue). Just flush the tail the throttle may not have painted yet.
     if self.live_ink == false then
+        self:cancelLive()
         self:renderStrokeToScreen(stroke)
+        self:refreshRegion(region)
+    else
+        local ld = self.live_dirty
+        if ld and (ld.w > 0 or ld.h > 0) then
+            self:flushLive(ld, stroke)
+        end
+        self.live_dirty = nil
+        self:cancelLive()
     end
-
-    self:refreshRegion(region)
-    if self.live_ink ~= false then
-        self:scheduleRefresh()
-    end
-end
-
-function StylusAnnotations:scheduleRefresh()
-    if self.refresh_timer then
-        UIManager:unschedule(self.refresh_timer)
-    end
-    local refresh_timer = function()
-        self.refresh_timer = nil
-        UIManager:setDirty(self.view, "full")
-    end
-    self.refresh_timer = refresh_timer
-    UIManager:scheduleIn(LIVE_REFRESH_DELAY_S, refresh_timer)
 end
 
 function StylusAnnotations:renderStrokeToScreen(stroke)
@@ -553,6 +543,7 @@ function StylusAnnotations:setupTouchZones()
 end
 
 function StylusAnnotations:onStrokeTap(ges)
+    if self.current_stroke then return true end
     if self:isOverlayActive() then return false end
     local stroke = self:findStrokeAt(ges)
     if not stroke then
@@ -564,6 +555,7 @@ function StylusAnnotations:onStrokeTap(ges)
 end
 
 function StylusAnnotations:onStrokeHold(ges)
+    if self.current_stroke then return true end
     if self:isOverlayActive() then return false end
     local stroke = self:findStrokeAt(ges)
     if not stroke then
@@ -774,7 +766,7 @@ end
 function StylusAnnotations:getStrokesFilePath()
     local sidecar_dir = self.ui.doc_settings and self.ui.doc_settings.doc_sidecar_dir
     if sidecar_dir then
-        return sidecar_dir .. "/stylus_annotations.lua"
+        return sidecar_dir .. "/stylus_annotations.lua", sidecar_dir
     end
     return nil
 end
@@ -792,10 +784,14 @@ function StylusAnnotations:scheduleSave()
 end
 
 function StylusAnnotations:saveStrokes()
-    local filepath = self:getStrokesFilePath()
+    local filepath, sidecar_dir = self:getStrokesFilePath()
     if not filepath then
         logger.warn("StylusAnnotations: no sidecar dir available, skipping save")
         return
+    end
+    local ok, err = util.makePath(sidecar_dir)
+    if not ok and err then
+        logger.warn("StylusAnnotations: failed to create sidecar dir:", err)
     end
     self.store:save(filepath)
 end
@@ -1036,11 +1032,8 @@ function StylusAnnotations:onCloseDocument()
         UIManager:unschedule(self.hold_timer)
         self.hold_timer = nil
     end
-    if self.refresh_timer then
-        UIManager:unschedule(self.refresh_timer)
-        self.refresh_timer = nil
-    end
     self.current_stroke = nil
+    self:cancelLive()
     self:teardownStylusCallback()
     self:saveStrokes()
 end

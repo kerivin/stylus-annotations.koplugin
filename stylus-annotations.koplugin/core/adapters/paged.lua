@@ -1,6 +1,13 @@
-local Base = require("lib/adapters/base")
+local Base = require("core/adapters/base")
+local Geometry = require("core/geometry")
+local Device = require("device")
+local logger = require("logger")
+
+local Screen = Device.screen
 
 local Paged = {}
+
+local MAPPING_LOG_STATES_PER_STROKE = 3
 
 function Paged:new(plugin)
     local o = Base:new(plugin)
@@ -47,16 +54,74 @@ function Paged:pageToScreenPoint(page, x_p, y_p)
     end
 end
 
+function Paged:pointToScreen(stroke, x_p, y_p)
+    return self:pageToScreenPoint(stroke.page, x_p, y_p)
+end
+
+function Paged:stateSignature(stroke)
+    local view = self.view
+    local page = stroke.page
+    if view.page_scroll then
+        local acc_y = 0
+        for _, state in ipairs(view.page_states) do
+            if state.page == page then
+                return table.concat{
+                    "rot=", tostring(state.rotation),
+                    "|zoom=", tostring(state.zoom),
+                    "|off=", tostring(state.offset.x), ",", tostring(state.offset.y),
+                    "|vis=", tostring(state.visible_area.x), ",", tostring(state.visible_area.y),
+                    ",", tostring(state.visible_area.w), ",", tostring(state.visible_area.h),
+                    "|acc=", tostring(acc_y),
+                }
+            end
+            acc_y = acc_y + state.visible_area.h + view.page_gap.height
+        end
+        return nil
+    else
+        local st = view.state
+        if not st or st.page ~= page then return nil end
+        return table.concat{
+            "rot=", tostring(st.rotation),
+            "|zoom=", tostring(st.zoom),
+            "|off=", tostring(st.offset.x), ",", tostring(st.offset.y),
+            "|vis=", tostring(view.visible_area.x), ",", tostring(view.visible_area.y),
+            ",", tostring(view.visible_area.w), ",", tostring(view.visible_area.h),
+        }
+    end
+end
+
+function Paged:maybeLogStrayMapping(stroke, spts, seen_key)
+    local x0, y0, x1, y1 = Geometry.screenBounds(spts)
+    if not x0 then return end
+    local w, h = Screen:getWidth(), Screen:getHeight()
+    local margin = Screen.scaleBySize and Screen:scaleBySize(8) or 8
+    if x0 < -margin or y0 < -margin or x1 > w + margin or y1 > h + margin or x1 < 0 or y1 < 0 then
+        local logged = stroke.mapping_debug_states or 0
+        if logged < MAPPING_LOG_STATES_PER_STROKE then
+            stroke.mapping_debug_states = logged + 1
+            logger.info(
+                "StylusAnnotations: stray mapping stroke", stroke.id,
+                "page", stroke.page, "zoom", stroke.zoom,
+                "bbox", table.concat{tostring(x0), ",", tostring(y0), ",", tostring(x1), ",", tostring(y1)},
+                "screen", w, "x", h,
+                "sig", seen_key)
+        end
+    end
+end
+
 function Paged:strokeToScreenPts(stroke)
     local pts = stroke.points
     local m = #pts
     if m == 0 then return nil end
+    local sig = self:stateSignature(stroke)
+    if not sig then return nil end
     local spts = {}
     for i = 1, m, 2 do
         local sx, sy = self:pageToScreenPoint(stroke.page, pts[i], pts[i + 1])
         if not sx then return nil end
         spts[i], spts[i + 1] = sx, sy
     end
+    self:maybeLogStrayMapping(stroke, spts, sig)
     return spts
 end
 

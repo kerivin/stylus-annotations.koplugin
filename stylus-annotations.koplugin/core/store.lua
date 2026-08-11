@@ -202,10 +202,6 @@ function StrokeStore:getSelectionUnionBox(strokes)
     return x0, y0, x1, y1
 end
 
-local function sidecarDirOf(filepath)
-    return filepath:match("^(.*)/[^/]+$") or "."
-end
-
 function StrokeStore:save(filepath)
     if not filepath then
         self.logger.warn("StrokeStore: no filepath given, skipping save")
@@ -218,11 +214,6 @@ function StrokeStore:save(filepath)
             self.logger.info("StrokeStore: no strokes, removed", filepath)
         end
         return
-    end
-    local dir = sidecarDirOf(filepath)
-    local ok, err = lfs.mkdir(dir)
-    if not ok and err ~= "File exists" then
-        self.logger.warn("StrokeStore: failed to create sidecar dir:", err)
     end
     local mapper = self.mapper
     local out = { "return {", tostring(StrokeStore.STORAGE_VERSION), ",strokes={" }
