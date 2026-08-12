@@ -4,7 +4,7 @@ local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Geometry = require("core/geometry")
 local Draw = require("core/draw")
-local PenInput = require("core/input/pen")
+local PenInput = require("core/pen")
 local Paged = require("core/mapping/paged")
 local Reflow = require("core/mapping/reflow")
 local StrokeStore = require("core/store")
@@ -55,8 +55,6 @@ local SAVE_DELAY_MS = 800
 local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_INTERVAL_MS = 33
 local DEFAULT_HOLD_INTERVAL_MS = 500
-
-local PEN_GRACE_TIME_S = 1.0
 
 local MIN_STROKE_WIDTH = 1
 local MAX_STROKE_WIDTH = 30
@@ -156,9 +154,7 @@ function StylusAnnotations:init()
         reader = true,
     })
 
-    self.pen_input = PenInput:new(self, {
-        pen_grace_time = Device:isAndroid() and 0 or PEN_GRACE_TIME_S,
-    })
+    self.pen_input = PenInput:new(self)
     self.pen_input:register()
     self:setupTouchZones()
 

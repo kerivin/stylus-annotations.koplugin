@@ -1,6 +1,5 @@
 local Device = require("device")
 local logger = require("logger")
-local time = require("ui/time")
 
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
 
@@ -14,14 +13,11 @@ local PenInput = {}
 PenInput.current = nil
 local gesture_hook_added = false
 
-function PenInput:new(plugin, opts)
-    opts = opts or {}
+function PenInput:new(plugin)
     local o = {
         plugin = plugin,
         stylus_registered = false,
         pen_active = false,
-        pen_grace_until = 0,
-        pen_grace_time = opts.pen_grace_time or 0,
     }
     return setmetatable(o, { __index = PenInput })
 end
@@ -31,7 +27,7 @@ function PenInput:isPenSlot(slot)
 end
 
 function PenInput:isPenActive()
-    return self.pen_active or (self.pen_grace_until > 0 and time.now() < self.pen_grace_until)
+    return self.pen_active
 end
 
 function PenInput:isPenInputAllowed()
@@ -42,10 +38,11 @@ function PenInput:installGestureHook()
     local Input = Device.input
     if gesture_hook_added or not Input or not Input.registerGestureAdjustHook then return end
     gesture_hook_added = true
-    Input:registerGestureAdjustHook(function(_, ges)
-        if PenInput.current
-            and PenInput.current:isPenActive()
-            and not PenInput.current.plugin:isOverlayActive() then
+    Input:registerGestureAdjustHook(function(input, ges)
+        local pen_input = PenInput.current
+        if pen_input
+            and pen_input:isPenActive()
+            and not pen_input.plugin:isOverlayActive() then
             ges.ges = "none"
         end
     end)
@@ -126,7 +123,6 @@ function PenInput:onStylusEvent(input, slot)
         if not plugin:isEnabled() then return false end
         if not self.pen_active then
             self.pen_active = true
-            logger.info("StylusAnnotations: pen down at", x, y)
         end
 
         if plugin.current_stroke then
@@ -139,9 +135,6 @@ function PenInput:onStylusEvent(input, slot)
 
     local was_active = self.pen_active
     self.pen_active = false
-    if self.pen_grace_time and self.pen_grace_time > 0 then
-        self.pen_grace_until = time.now() + time.s(self.pen_grace_time)
-    end
     if plugin.current_stroke then
         plugin:endStroke()
     end
