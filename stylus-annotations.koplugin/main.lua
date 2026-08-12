@@ -196,7 +196,12 @@ end
 
 function StylusAnnotations:loadSettings()
     local ds = self.ui.doc_settings
-    self.live_ink = ds:readSetting("stylus_annotations_live_ink") ~= false
+    local saved = ds:readSetting("stylus_annotations_live_ink")
+    if saved ~= nil then
+        self.live_ink = saved
+    else
+        self.live_ink = not Device:hasEinkScreen()
+    end
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
     self.color = ds:readSetting("stylus_annotations_color") or DEFAULT_COLOR
 end
