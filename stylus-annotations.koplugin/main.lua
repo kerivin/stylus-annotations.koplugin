@@ -35,6 +35,10 @@ local PEN_GRACE_TIME_S = 1.0
 
 local DEFAULT_HOLD_INTERVAL_MS = 500
 
+local DEFAULT_WIDTH = 2
+local DEFAULT_COLOR = "orange"
+local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
+
 local active_plugin = nil
 local gesture_hook_added = false
 
@@ -54,11 +58,6 @@ local function installGestureHook()
         end
     end)
 end
-
-local DEFAULT_WIDTH = 2
-local DEFAULT_COLOR = "orange"
-
-local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
 
 local PREVIEW_POINTS = {
     {10.8,1.1}, {8.3,4.3}, {6.2,14.0}, {4.3,28.0}, {2.9,40.9}, {1.4,55.9},
@@ -602,31 +601,9 @@ function StylusAnnotations:onStrokeHold(ges)
     if self:isOverlayActive() then return false end
     local stroke = self:findStrokeAt(ges)
     if not stroke then
-
         return false
     end
-    local selection = self.store:selectStrokesChain(stroke)
-    if #selection == 1 and #self.store.strokes > 1 then
-        local parts = {}
-        local c0, c1, c2, c3 = Geometry.screenBounds(
-            self.adapter:strokeToScreenPts(stroke) or {})
-        for _, s in ipairs(self.store.strokes) do
-            if s ~= stroke then
-                local a0, a1, a2, a3 = Geometry.screenBounds(
-                    self.adapter:strokeToScreenPts(s) or {})
-                parts[#parts + 1] = string.format(
-                    "%s(page=%s,box=%s,cur_box=%s,intersect=%s)",
-                    tostring(s.id), tostring(s.page),
-                    a0 and string.format("%d,%d,%d,%d", a0, a1, a2, a3) or "nil",
-                    c0 and string.format("%d,%d,%d,%d", c0, c1, c2, c3) or "nil",
-                    tostring(self.store:strokesIntersectMid(stroke, s)))
-            end
-        end
-        logger.warn("StylusAnnotations: hold on", stroke.id,
-            "page", stroke.page, "chain singleton; candidates:",
-            table.concat(parts, " | "))
-    end
-    self:showStrokeMenu(selection)
+    self:showStrokeMenu(self.store:selectStrokesChain(stroke))
     return true
 end
 

@@ -41,31 +41,6 @@ function Geometry.strokeDistanceSq(px, py, stroke)
     return min_sq
 end
 
-function Geometry.strokeBBox(stroke)
-    local pts = stroke and stroke.points
-    if not pts or #pts == 0 then
-        return nil
-    end
-    local m = #pts
-    local x0, y0 = pts[1], pts[2]
-    local x1, y1 = x0, y0
-    for i = 3, m, 2 do
-        local px, py = pts[i], pts[i + 1]
-        if px < x0 then x0 = px end
-        if px > x1 then x1 = px end
-        if py < y0 then y0 = py end
-        if py > y1 then y1 = py end
-    end
-    return x0, y0, x1, y1
-end
-
-function Geometry.strokesIntersect(a, b)
-    local ax0, ay0, ax1, ay1 = Geometry.strokeBBox(a)
-    local bx0, by0, bx1, by1 = Geometry.strokeBBox(b)
-    if not ax0 or not bx0 then return false end
-    return ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1
-end
-
 function Geometry.screenBounds(spts)
     local n = math.floor(#spts / 2)
     if n == 0 then return end
@@ -112,6 +87,24 @@ function Geometry.clampRect(x, y, w, h, width, height)
     local rh = math.min(height - ry, math.ceil(h))
     if rw <= 0 or rh <= 0 then return end
     return rx, ry, rw, rh
+end
+
+function Geometry.mergeBounds(x0, y0, x1, y1, u0, v0, u1, v1)
+    if not x0 then return u0, v0, u1, v1 end
+    return math.min(x0, u0), math.min(y0, v0), math.max(x1, u1), math.max(y1, v1)
+end
+
+function Geometry.boundsOverlap(x0, y0, x1, y1, u0, v0, u1, v1, pad_a, pad_b)
+    local pa = pad_a or 0
+    local pb = pad_b or pa
+    return x0 - pa < u1 + pb and u0 - pb < x1 + pa
+        and y0 - pa < v1 + pb and v0 - pb < y1 + pa
+end
+
+function Geometry.paddedRect(x0, y0, x1, y1, pad)
+    local x = math.min(x0, x1) - pad
+    local y = math.min(y0, y1) - pad
+    return { x = x, y = y, w = math.abs(x1 - x0) + 2 * pad, h = math.abs(y1 - y0) + 2 * pad }
 end
 
 function Geometry.rdpSimplifyIndices(spts, tol)

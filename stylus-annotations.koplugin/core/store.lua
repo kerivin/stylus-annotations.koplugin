@@ -114,10 +114,20 @@ function StrokeStore:findStrokeAt(x, y)
     return best
 end
 
+function StrokeStore:getStrokePad(stroke)
+    return math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
+end
+
 function StrokeStore:strokesIntersectMid(a, b)
     local mapper = self.mapper
-    return Geometry.strokesIntersect({ points = mapper:strokeToScreenPts(a) or {} },
-                                      { points = mapper:strokeToScreenPts(b) or {} })
+    local as = mapper:strokeToScreenPts(a)
+    local bs = mapper:strokeToScreenPts(b)
+    if not as or not bs then return false end
+    local ax0, ay0, ax1, ay1 = Geometry.screenBounds(as)
+    local bx0, by0, bx1, by1 = Geometry.screenBounds(bs)
+    if not ax0 or not bx0 then return false end
+    return Geometry.boundsOverlap(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1,
+        self:getStrokePad(a), self:getStrokePad(b))
 end
 
 function StrokeStore:selectStrokesChain(stroke)
@@ -183,8 +193,8 @@ end
 function StrokeStore:getSelectionRect(stroke, width, height)
     local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
     if not x0 then return end
-    local pad = math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
-    return Geometry.clampRect(x0 - pad, y0 - pad, (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad, width, height)
+    local rect = Geometry.paddedRect(x0, y0, x1, y1, self:getStrokePad(stroke))
+    return Geometry.clampRect(rect.x, rect.y, rect.w, rect.h, width, height)
 end
 
 function StrokeStore:getSelectionUnionBox(strokes)
@@ -192,10 +202,7 @@ function StrokeStore:getSelectionUnionBox(strokes)
     for _, stroke in ipairs(strokes) do
         local sx0, sy0, sx1, sy1 = self:getStrokeScreenBox(stroke)
         if sx0 then
-            if not x0 or sx0 < x0 then x0 = sx0 end
-            if not y0 or sy0 < y0 then y0 = sy0 end
-            if not x1 or sx1 > x1 then x1 = sx1 end
-            if not y1 or sy1 > y1 then y1 = sy1 end
+            x0, y0, x1, y1 = Geometry.mergeBounds(x0, y0, x1, y1, sx0, sy0, sx1, sy1)
         end
     end
     return x0, y0, x1, y1
