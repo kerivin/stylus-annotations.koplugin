@@ -7,22 +7,22 @@ local Screen = Device.screen
 
 local SELECTION_WHITE = Blitbuffer.ColorRGB32(0xFF, 0xFF, 0xFF, 0xFF)
 
-local Base = {}
+local Mapping = {}
 
-function Base:new(plugin)
+function Mapping:new(plugin)
     local o = {
         plugin = plugin,
         ui = plugin.ui,
         view = plugin.view,
     }
-    return setmetatable(o, { __index = Base })
+    return setmetatable(o, { __index = Mapping })
 end
 
-function Base:getStrokeScreenWidth(stroke)
+function Mapping:getStrokeScreenWidth(stroke)
     return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
 end
 
-function Base:packPoints(points)
+function Mapping:packPoints(points)
     local coords = {}
     for i = 1, #points do
         coords[#coords + 1] = tostring(Geometry.pack(points[i]))
@@ -30,7 +30,7 @@ function Base:packPoints(points)
     return "points={" .. table.concat(coords, ",") .. "}"
 end
 
-function Base:unpackPoints(pts)
+function Mapping:unpackPoints(pts)
     if not pts or type(pts[1]) == "table" then return nil end
     local points = {}
     for i = 1, #pts do
@@ -44,29 +44,11 @@ function Base:unpackPoints(pts)
     return points
 end
 
-function Base:pointToScreen(stroke, x_p, y_p)
-    return x_p, y_p
-end
-
-function Base:paintSegment(bb, x, y, stroke, ax, ay, bx, by)
-    local p0x, p0y = self:pointToScreen(stroke, ax, ay)
-    if not p0x then return end
-    local p1x, p1y = self:pointToScreen(stroke, bx, by)
-    if not p1x then return end
-    local color = Draw.getRenderColor(stroke, self.ui.highlight)
-    local sw = self:getStrokeScreenWidth(stroke)
-    local sph = {
-        { x = x + p0x, y = y + p0y },
-        { x = x + p1x, y = y + p1y },
-    }
-    Draw.paintStrokePath(bb, sph, sw, color)
-end
-
-function Base:getPageZoom(page)
+function Mapping:getPageZoom(page)
     return self:getZoom(page)
 end
 
-function Base:paintStroke(bb, x, y, stroke)
+function Mapping:paintStroke(bb, x, y, stroke)
     local color = Draw.getRenderColor(stroke, self.ui.highlight)
     local sw = self:getStrokeScreenWidth(stroke)
     local spts = self:strokeToScreenPts(stroke)
@@ -78,7 +60,7 @@ function Base:paintStroke(bb, x, y, stroke)
     Draw.paintStrokePath(bb, sph, sw, color)
 end
 
-function Base:paintStrokeSolid(bb, x, y, stroke, color)
+function Mapping:paintStrokeSolid(bb, x, y, stroke, color)
     local sw = self:getStrokeScreenWidth(stroke)
     local spts = self:strokeToScreenPts(stroke)
     if not spts or #spts == 0 then return end
@@ -89,11 +71,11 @@ function Base:paintStrokeSolid(bb, x, y, stroke, color)
     Draw.paintStrokeSolid(bb, sph, sw, color)
 end
 
-function Base:renderStrokeToScreen(stroke)
+function Mapping:renderStrokeToScreen(stroke)
     self:paintStroke(Screen.bb, 0, 0, stroke)
 end
 
-function Base:paintSelection(bb, x, y)
+function Mapping:paintSelection(bb, x, y)
     local selected = self.plugin.selected_strokes
     for _, stroke in ipairs(selected) do
         local rx, ry, rw, rh = self.plugin.store:getSelectionRect(stroke, bb:getWidth(), bb:getHeight())
@@ -106,7 +88,7 @@ function Base:paintSelection(bb, x, y)
     end
 end
 
-function Base:paintTo(bb, x, y)
+function Mapping:paintTo(bb, x, y)
     self:forEachVisibleStroke(function(stroke)
         self:paintStroke(bb, x, y, stroke)
     end)
@@ -117,4 +99,4 @@ function Base:paintTo(bb, x, y)
     self:paintSelection(bb, x, y)
 end
 
-return Base
+return Mapping

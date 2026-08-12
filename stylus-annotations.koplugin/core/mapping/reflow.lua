@@ -1,5 +1,5 @@
 local Device = require("device")
-local Base = require("core/adapters/base")
+local Mapping = require("core/mapping/base")
 local Geometry = require("core/geometry")
 local logger = require("logger")
 
@@ -12,7 +12,7 @@ local PROBE_MAX_DIST_PX = 900
 local Reflow = {}
 
 function Reflow:new(plugin)
-    local o = Base:new(plugin)
+    local o = Mapping:new(plugin)
     return setmetatable(o, { __index = Reflow })
 end
 
@@ -76,15 +76,6 @@ function Reflow:anchorScale(stroke, b)
     if sy < 0.05 then sy = 0.05 end
     if sy > 20 then sy = 20 end
     return sx, sy
-end
-
-function Reflow:pointToScreen(stroke, x_p, y_p)
-    local doc = self:getDoc()
-    local boxes = doc:getScreenBoxesFromPositions(stroke.anchor.pos0, stroke.anchor.pos1, true)
-    if not boxes or #boxes == 0 then return nil end
-    local b = boxes[1]
-    local sx, sy = self:anchorScale(stroke, b)
-    return b.x + x_p * sx, b.y + y_p * sy
 end
 
 function Reflow:strokeToScreenPts(stroke)
@@ -179,6 +170,6 @@ function Reflow:deserializeStroke(data)
     return stroke
 end
 
-setmetatable(Reflow, { __index = Base })
+setmetatable(Reflow, { __index = Mapping })
 
 return Reflow

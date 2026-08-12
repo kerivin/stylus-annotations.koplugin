@@ -4,8 +4,10 @@ local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Geometry = require("core/geometry")
 local Draw = require("core/draw")
-local PagedAdapter = require("core/adapters/paged")
-local ReflowAdapter = require("core/adapters/reflow")
+local AndroidPenInput = require("core/input/android")
+local LinuxPenInput = require("core/input/linux")
+local Paged = require("core/mapping/paged")
+local Reflow = require("core/mapping/reflow")
 local StrokeStore = require("core/store")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
@@ -50,37 +52,25 @@ if not current_version or current_version < MIN_KOREADER_VERSION then
     return IncompatibleVersion
 end
 
-local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
-
 local SAVE_DELAY_MS = 800
 local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_INTERVAL_MS = 33
-local PEN_GRACE_TIME_S = 1.0
-
 local DEFAULT_HOLD_INTERVAL_MS = 500
 
+local MIN_STROKE_WIDTH = 1
+local MAX_STROKE_WIDTH = 30
 local DEFAULT_WIDTH = 2
 local DEFAULT_COLOR = "orange"
 local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
 
-local active_plugin = nil
-local gesture_hook_added = false
+local FULL_SCREEN_ZONE = {
+    ratio_x = 0, ratio_y = 0,
+    ratio_w = 1, ratio_h = 1,
+}
 
 local function holdIntervalSeconds()
     local ms = G_reader_settings:readSetting("ges_hold_interval_ms") or DEFAULT_HOLD_INTERVAL_MS
     return ms / 1000
-end
-
-local function installGestureHook()
-    local Input = Device.input
-    if not Input or not Input.registerGestureAdjustHook then return end
-    if gesture_hook_added then return end
-    gesture_hook_added = true
-    Input:registerGestureAdjustHook(function(_, ges)
-        if active_plugin and active_plugin:isPenActive() and not active_plugin:isOverlayActive() then
-            ges.ges = "none"
-        end
-    end)
 end
 
 local PREVIEW_POINTS = {
@@ -122,12 +112,7 @@ local StylusAnnotations = InputContainer:extend{
 
     store = nil,
 
-    stylus_callback_registered = false,
-    touch_pen_fallback_registered = false,
     touch_zones_registered = false,
-
-    pen_active = false,
-    pen_grace_until = 0,
 
     current_stroke = nil,
     pen_x = 0,
@@ -151,12 +136,11 @@ local StylusAnnotations = InputContainer:extend{
 
 function StylusAnnotations:init()
     self.stroke_id_counter = 0
-    active_plugin = self
 
     self.view = self.ui.view
 
-    self.adapter = (self.ui.paging and PagedAdapter:new(self) or ReflowAdapter:new(self))
-    self.store = StrokeStore:new(self.adapter, logger)
+    self.mapper = (self.ui.paging and Paged:new(self) or Reflow:new(self))
+    self.store = StrokeStore:new(self.mapper, logger)
 
     self:loadSettings()
 
@@ -171,10 +155,9 @@ function StylusAnnotations:init()
         reader = true,
     })
 
-    self:setupStylusCallback()
-    self:setupPenPanZones()
+    self.pen_input = (Device:isAndroid() and AndroidPenInput or LinuxPenInput):new(self)
+    self.pen_input:register()
     self:setupTouchZones()
-    installGestureHook()
 
     dbg:turnOff()
 
@@ -186,8 +169,20 @@ function StylusAnnotations:onReaderReady()
     self.ui:handleEvent(Event:new("UpdatePos"))
 end
 
+function StylusAnnotations:onCloseDocument()
+    if self.pending_save then
+        UIManager:unschedule(self.pending_save)
+        self.pending_save = nil
+    end
+    self:cancelHoldTimer()
+    self.current_stroke = nil
+    self:cancelLive()
+    self.pen_input:unregister()
+    self:saveStrokes()
+end
+
 function StylusAnnotations:isEnabled()
-    return G_reader_settings:readSetting("stylus_annotations_enabled") == true
+    return G_reader_settings:readSetting("stylus_annotations_enabled") ~= false
 end
 
 function StylusAnnotations:setEnabled(enabled)
@@ -213,108 +208,8 @@ function StylusAnnotations:saveSettings()
     ds:saveSetting("stylus_annotations_color", self.color)
 end
 
-function StylusAnnotations:setupStylusCallback()
-    if self.stylus_callback_registered then return end
-    local Input = Device.input
-    if Input and Input.registerStylusCallback then
-        local plugin = self
-        Input:registerStylusCallback(function(input, slot)
-            return plugin:onStylusEvent(input, slot)
-        end)
-        self.stylus_callback_registered = true
-    else
-        logger.warn("StylusAnnotations: stylus callback API not available")
-    end
-end
-
-function StylusAnnotations:teardownStylusCallback()
-    if not self.stylus_callback_registered then return end
-    local Input = Device.input
-    if Input and Input.unregisterStylusCallback then
-        Input:unregisterStylusCallback()
-    end
-    self.stylus_callback_registered = false
-end
-
-function StylusAnnotations:setupPenPanZones()
-    if self.touch_pen_fallback_registered then return end
-    self.ui:registerTouchZones({
-        {
-            id = "stylus_annotations_pen_pan",
-            ges = "pan",
-            screen_zone = {
-                ratio_x = 0, ratio_y = 0,
-                ratio_w = 1, ratio_h = 1,
-            },
-            overrides = {
-                "rolling_pan",
-                "rolling_pan_release",
-                "paging_pan",
-                "paging_pan_release",
-            },
-            handler = function(ges)
-                return self:onPenPan(ges)
-            end,
-        },
-        {
-            id = "stylus_annotations_pen_pan_release",
-            ges = "pan_release",
-            screen_zone = {
-                ratio_x = 0, ratio_y = 0,
-                ratio_w = 1, ratio_h = 1,
-            },
-            overrides = {
-                "rolling_pan_release",
-                "paging_pan_release",
-            },
-            handler = function(ges)
-                return self:onPenPanRelease(ges)
-            end,
-        },
-    })
-    self.touch_pen_fallback_registered = true
-    logger.info("StylusAnnotations: pen pan gesture zones registered")
-end
-
 function StylusAnnotations:isPenActive()
-    if self.pen_active then return true end
-    return self.pen_grace_until > 0 and time.now() < self.pen_grace_until
-end
-
-function StylusAnnotations:onPenPan(ges)
-    if self.current_stroke then
-        if self.stylus_callback_registered then return true end
-        local cur = ges.pos
-        self:addStrokePoint(cur.x, cur.y)
-        return true
-    end
-
-    if not self:isPenActive() then return false end
-    if self:isOverlayActive() then return false end
-    if not self:isEnabled() then return false end
-    if self.stylus_callback_registered then return true end
-    local start = ges.start_pos or ges.pos
-    local cur = ges.pos
-    self:startStroke(start.x, start.y)
-    if self.current_stroke then
-        self:addStrokePoint(cur.x, cur.y)
-    end
-    return true
-end
-
-function StylusAnnotations:onPenPanRelease(ges)
-    if self.current_stroke then
-        if not self.stylus_callback_registered then
-            self:endStroke()
-        end
-        return true
-    end
-
-    if not self:isPenActive() then return false end
-    if self:isOverlayActive() then return false end
-    if not self:isEnabled() then return false end
-    if self.stylus_callback_registered then return true end
-    return true
+    return self.pen_input and self.pen_input:isPenActive() or false
 end
 
 function StylusAnnotations:isOverlayActive()
@@ -323,37 +218,73 @@ function StylusAnnotations:isOverlayActive()
     return (top.name or top.id) ~= "ReaderUI"
 end
 
-function StylusAnnotations:onStylusEvent(input, slot)
-    local x, y = slot.x or 0, slot.y or 0
-    if (slot.tool or TOOL_TYPE_PEN) ~= TOOL_TYPE_PEN then return false end
+function StylusAnnotations:setupTouchZones()
+    if self.touch_zones_registered then return end
+    self.ui:registerTouchZones({
+        {
+            id = "stylus_annotations_tap",
+            ges = "tap",
+            screen_zone = FULL_SCREEN_ZONE,
+            overrides = {
+                "readerfooter_holding",
+                "readerfooter_tap",
+                "readerconfigmenu_tap",
+                "readerconfigmenu_ext_tap",
+                "tap_forward",
+                "tap_backward",
+                "readermenu_tap",
+                "readermenu_ext_tap",
+                "tap_top_left_corner",
+                "tap_top_right_corner",
+                "tap_left_bottom_corner",
+                "tap_right_bottom_corner",
+            },
+            handler = function(ges)
+                return self:onStrokeTap(ges)
+            end,
+        },
 
-    if slot.id and slot.id >= 0 then
-        if self:isOverlayActive() then return false end
-        if not self:isEnabled() then return false end
-        if not self.pen_active then
-            self.pen_active = true
-            logger.info("StylusAnnotations: pen down at", x, y)
-        end
+        {
+            id = "stylus_annotations_hold",
+            ges = "hold",
+            screen_zone = FULL_SCREEN_ZONE,
+            overrides = {
+                "readerhighlight_hold",
+                "readerfooter_hold",
+            },
+            handler = function(ges)
+                return self:onStrokeHold(ges)
+            end,
+        },
+    })
+    self.touch_zones_registered = true
+end
 
-        if self.current_stroke then
-            self:addStrokePoint(x, y)
-        else
-            self:startStroke(x, y)
-        end
-        return true
+function StylusAnnotations:selectStrokeAt(ges, chain)
+    if self.current_stroke then return true end
+    if self:isPenActive() then return true end
+    if self:isOverlayActive() then return false end
+    local stroke = self:findStrokeAt(ges)
+    if not stroke then return false end
+    if chain then
+        self:showStrokeMenu(self.store:selectStrokesChain(stroke))
+    else
+        self:showStrokeMenu({ stroke })
     end
+    return true
+end
 
-    local was_active = self.pen_active
-    self.pen_active = false
-    self.pen_grace_until = time.now() + time.s(PEN_GRACE_TIME_S)
-    if self.current_stroke then
-        self:endStroke()
-    end
+function StylusAnnotations:onStrokeTap(ges)
+    return self:selectStrokeAt(ges)
+end
 
-    if not self:isOverlayActive() and self:isEnabled() and was_active then
-        return true
-    end
-    return false
+function StylusAnnotations:onStrokeHold(ges)
+    return self:selectStrokeAt(ges, true)
+end
+
+function StylusAnnotations:findStrokeAt(ges)
+    if not ges or not ges.pos then return nil end
+    return self.store:findStrokeAt(ges.pos.x, ges.pos.y)
 end
 
 function StylusAnnotations:startStroke(x, y)
@@ -365,7 +296,7 @@ function StylusAnnotations:startStroke(x, y)
         alpha = 1.0,
         datetime = os.time(),
     }
-    if not self.adapter:initStroke(stroke, x, y) then
+    if not self.mapper:initStroke(stroke, x, y) then
         self.stroke_id_counter = self.stroke_id_counter - 1
         return
     end
@@ -384,21 +315,13 @@ function StylusAnnotations:startStroke(x, y)
     end
 
     self.hold_start_x, self.hold_start_y = x, y
-    if self.hold_timer then
-        UIManager:unschedule(self.hold_timer)
-    end
-    local hold_action = function()
-        self.hold_timer = nil
-        self:onStrokeHoldTimer()
-    end
-    self.hold_timer = hold_action
-    UIManager:scheduleIn(holdIntervalSeconds(), hold_action)
+    self:scheduleHoldTimer()
 end
 
 function StylusAnnotations:addStrokePoint(x, y)
     local stroke = self.current_stroke
     if not stroke then return end
-    if not self.adapter:addPoint(stroke, x, y) then return end
+    if not self.mapper:addPoint(stroke, x, y) then return end
 
     local sw = self:getStrokeScreenWidth(stroke)
     local pad = math.floor(sw / 2) + 1
@@ -406,20 +329,82 @@ function StylusAnnotations:addStrokePoint(x, y)
     local seg_y = math.min(self.pen_y, y) - pad
     local seg_w = math.abs(x - self.pen_x) + 2 * pad
     local seg_h = math.abs(y - self.pen_y) + 2 * pad
-    self:accumulateDirty(seg_x, seg_y, seg_w, seg_h)
-
-    if self.live_ink ~= false then
-        self.live_dirty = Geometry.mergeRect(self.live_dirty, seg_x, seg_y, seg_w, seg_h)
-        self:flushLiveThrottled()
-    end
+    self:accumulateSegment(seg_x, seg_y, seg_w, seg_h)
 
     self.pen_x, self.pen_y = x, y
 
     if self.hold_timer
         and (math.abs(x - self.hold_start_x) > HOLD_MOVE_THRESHOLD_PX
             or math.abs(y - self.hold_start_y) > HOLD_MOVE_THRESHOLD_PX) then
+        self:cancelHoldTimer()
+    end
+end
+
+function StylusAnnotations:accumulateSegment(x, y, w, h)
+    self.dirty_region = Geometry.mergeRect(self.dirty_region, x, y, w, h)
+    if self.live_ink ~= false then
+        self.live_dirty = Geometry.mergeRect(self.live_dirty, x, y, w, h)
+        self:flushLiveThrottled()
+    end
+end
+
+function StylusAnnotations:scheduleHoldTimer()
+    self:cancelHoldTimer()
+    self.hold_timer = function()
+        self.hold_timer = nil
+        self:onStrokeHoldTimer()
+    end
+    UIManager:scheduleIn(holdIntervalSeconds(), self.hold_timer)
+end
+
+function StylusAnnotations:cancelHoldTimer()
+    if self.hold_timer then
         UIManager:unschedule(self.hold_timer)
         self.hold_timer = nil
+    end
+end
+
+function StylusAnnotations:onStrokeHoldTimer()
+    local stroke = self.current_stroke
+    if not stroke then return end
+    local dx = self.pen_x - self.hold_start_x
+    local dy = self.pen_y - self.hold_start_y
+    if dx * dx + dy * dy > HOLD_MOVE_THRESHOLD_PX * HOLD_MOVE_THRESHOLD_PX then return end
+    self:onStrokeCancel()
+    self:showStrokeMenuAt(self.hold_start_x, self.hold_start_y)
+end
+
+function StylusAnnotations:onStrokeCancel()
+    self.current_stroke = nil
+    self.dirty_region = nil
+    self:cancelLive()
+    UIManager:setDirty(self.view, "partial")
+end
+
+function StylusAnnotations:endStroke()
+    self:cancelHoldTimer()
+    local stroke = self.current_stroke
+    local region = self.dirty_region
+    self.current_stroke = nil
+    self.dirty_region = nil
+    if not stroke or #stroke.points == 0 then return end
+
+    stroke.points = self.store:decimatePoints(stroke)
+
+    self.store:add(stroke)
+
+    self:scheduleSave()
+
+    if self.live_ink == false then
+        self:cancelLive()
+        self:renderStrokeToScreen(stroke)
+        self:refreshRegion(region)
+    else
+        local ld = self.live_dirty
+        if ld and (ld.w > 0 or ld.h > 0) then
+            self:flushLive(region or ld, stroke)
+        end
+        self:cancelLive()
     end
 end
 
@@ -460,43 +445,11 @@ function StylusAnnotations:cancelLive()
     self.live_dirty = nil
 end
 
-function StylusAnnotations:endStroke()
-    if self.hold_timer then
-        UIManager:unschedule(self.hold_timer)
-        self.hold_timer = nil
-    end
-    local stroke = self.current_stroke
-    local region = self.dirty_region
-    self.current_stroke = nil
-    self.dirty_region = nil
-    if not stroke or #stroke.points == 0 then return end
-
-    stroke.points = self.store:decimatePoints(stroke)
-
-    self.store:add(stroke)
-
-    self:scheduleSave()
-
-    if self.live_ink == false then
-        self:cancelLive()
-        self:renderStrokeToScreen(stroke)
-        self:refreshRegion(region)
-    else
-        local ld = self.live_dirty
-        if ld and (ld.w > 0 or ld.h > 0) then
-            self:flushLive(region or ld, stroke)
-        end
-        self.live_dirty = nil
-        self:cancelLive()
-    end
-end
-
 function StylusAnnotations:renderStrokeToScreen(stroke)
-    self.adapter:renderStrokeToScreen(stroke)
+    self.mapper:renderStrokeToScreen(stroke)
 end
 
 function StylusAnnotations:refreshRegion(region)
-
     if region then
         local rx, ry, rw, rh = Geometry.clampRect(
             region.x, region.y, region.w, region.h, Screen:getWidth(), Screen:getHeight())
@@ -510,133 +463,24 @@ function StylusAnnotations:refreshRegion(region)
     UIManager:setDirty(self.view, "partial")
 end
 
-function StylusAnnotations:onStrokeHoldTimer()
-    local stroke = self.current_stroke
-    if not stroke then return end
-    local dx = self.pen_x - self.hold_start_x
-    local dy = self.pen_y - self.hold_start_y
-    if dx * dx + dy * dy > HOLD_MOVE_THRESHOLD_PX * HOLD_MOVE_THRESHOLD_PX then return end
-    self:onStrokeCancel()
-    self:showStrokeMenuAt(self.hold_start_x, self.hold_start_y)
-end
-
-function StylusAnnotations:onStrokeCancel()
-    self.current_stroke = nil
-    self.dirty_region = nil
-    self:cancelLive()
-    UIManager:setDirty(self.view, "partial")
-end
-
-function StylusAnnotations:showStrokeMenuAt(x, y)
-    local stroke = self.store:findStrokeAt(x, y)
-    if not stroke then return end
-    self:showStrokeMenu({ stroke })
+function StylusAnnotations:paintTo(bb, x, y)
+    self.mapper:paintTo(bb, x, y)
 end
 
 function StylusAnnotations:getStrokeScreenWidth(stroke)
-    return self.adapter:getStrokeScreenWidth(stroke)
-end
-
-function StylusAnnotations:accumulateDirty(x, y, w, h)
-    self.dirty_region = Geometry.mergeRect(self.dirty_region, x, y, w, h)
-end
-
-function StylusAnnotations:paintTo(bb, x, y)
-    self.adapter:paintTo(bb, x, y)
+    return self.mapper:getStrokeScreenWidth(stroke)
 end
 
 function StylusAnnotations:getVisiblePages()
-    return self.adapter:getVisiblePages()
+    return self.mapper:getVisiblePages()
 end
 
 function StylusAnnotations:getPageZoom(page)
-    return self.adapter:getPageZoom(page)
+    return self.mapper:getPageZoom(page)
 end
 
 function StylusAnnotations:getSelectionRect(stroke, width, height)
     return self.store:getSelectionRect(stroke, width, height)
-end
-
-function StylusAnnotations:paintStrokeSolid(bb, x, y, stroke, color)
-    self.adapter:paintStrokeSolid(bb, x, y, stroke, color)
-end
-
-function StylusAnnotations:setupTouchZones()
-    if self.touch_zones_registered then return end
-    self.ui:registerTouchZones({
-        {
-            id = "stylus_annotations_tap",
-            ges = "tap",
-            screen_zone = {
-                ratio_x = 0, ratio_y = 0,
-                ratio_w = 1, ratio_h = 1,
-            },
-            overrides = {
-                "readerfooter_holding",
-                "readerfooter_tap",
-                "readerconfigmenu_tap",
-                "readerconfigmenu_ext_tap",
-                "tap_forward",
-                "tap_backward",
-                "readermenu_tap",
-                "readermenu_ext_tap",
-                "tap_top_left_corner",
-                "tap_top_right_corner",
-                "tap_left_bottom_corner",
-                "tap_right_bottom_corner",
-            },
-            handler = function(ges)
-                return self:onStrokeTap(ges)
-            end,
-        },
-
-        {
-            id = "stylus_annotations_hold",
-            ges = "hold",
-            screen_zone = {
-                ratio_x = 0, ratio_y = 0,
-                ratio_w = 1, ratio_h = 1,
-            },
-            overrides = {
-                "readerhighlight_hold",
-                "readerfooter_hold",
-            },
-            handler = function(ges)
-                return self:onStrokeHold(ges)
-            end,
-        },
-    })
-    self.touch_zones_registered = true
-end
-
-function StylusAnnotations:onStrokeTap(ges)
-    if self.current_stroke then return true end
-    if self:isPenActive() then return true end
-    if self:isOverlayActive() then return false end
-    local stroke = self:findStrokeAt(ges)
-    if not stroke then
-
-        return false
-    end
-    self:showStrokeMenu({ stroke })
-    return true
-end
-
-function StylusAnnotations:onStrokeHold(ges)
-    if self.current_stroke then return true end
-    if self:isPenActive() then return true end
-    if self:isOverlayActive() then return false end
-    local stroke = self:findStrokeAt(ges)
-    if not stroke then
-        return false
-    end
-    self:showStrokeMenu(self.store:selectStrokesChain(stroke))
-    return true
-end
-
-function StylusAnnotations:findStrokeAt(ges)
-    if #self.store.strokes == 0 or not ges or not ges.pos then return nil end
-    return self.store:findStrokeAt(ges.pos.x, ges.pos.y)
 end
 
 function StylusAnnotations:selectionsEqual(a, b)
@@ -690,7 +534,7 @@ function StylusAnnotations:grabSelectionBackup()
 end
 
 function StylusAnnotations:paintSelectionToScreen()
-    self.adapter:paintSelection(Screen.bb, 0, 0)
+    self.mapper:paintSelection(Screen.bb, 0, 0)
     self:refreshRegion()
 end
 
@@ -725,25 +569,25 @@ function StylusAnnotations:showStrokeMenu(strokes)
                     text = "\u{F48E}",
                     callback = function()
                         local count = #strokes
-                        self:clearSelection()
-                        UIManager:close(dialog)
-                        self:deleteStrokes(strokes, count > 1)
+                        self:closeStrokeDialog(dialog, function()
+                            self:deleteStrokes(strokes, count > 1)
+                        end)
                     end,
                 },
                 {
                     text = _("Color"),
                     callback = function()
-                        self:clearSelection()
-                        UIManager:close(dialog)
-                        self:chooseStrokeColor(strokes)
+                        self:closeStrokeDialog(dialog, function()
+                            self:chooseStrokeColor(strokes)
+                        end)
                     end,
                 },
                 {
                     text = _("Width"),
                     callback = function()
-                        self:clearSelection()
-                        UIManager:close(dialog)
-                        self:chooseStrokeWidth(strokes)
+                        self:closeStrokeDialog(dialog, function()
+                            self:chooseStrokeWidth(strokes)
+                        end)
                     end,
                 },
             },
@@ -752,17 +596,16 @@ function StylusAnnotations:showStrokeMenu(strokes)
     UIManager:show(dialog, "[ui]")
 end
 
-function StylusAnnotations:chooseStrokeColor(strokes)
-    self:showColorPicker(strokes[1].color, function(value)
-        self:setStrokeColor(strokes, value)
-    end)
+function StylusAnnotations:closeStrokeDialog(dialog, action)
+    self:clearSelection()
+    UIManager:close(dialog)
+    action()
 end
 
-function StylusAnnotations:choosePenColor()
-    self:showColorPicker(self.color, function(value)
-        self.color = value
-        self:saveSettings()
-    end)
+function StylusAnnotations:showStrokeMenuAt(x, y)
+    local stroke = self.store:findStrokeAt(x, y)
+    if not stroke then return end
+    self:showStrokeMenu({ stroke })
 end
 
 function StylusAnnotations:showColorPicker(current, apply)
@@ -784,6 +627,29 @@ function StylusAnnotations:showColorPicker(current, apply)
     UIManager:show(selector)
 end
 
+function StylusAnnotations:chooseStrokeColor(strokes)
+    self:showColorPicker(strokes[1].color, function(value)
+        self:setStrokeColor(strokes, value)
+    end)
+end
+
+function StylusAnnotations:choosePenColor()
+    self:showColorPicker(self.color, function(value)
+        self.color = value
+        self:saveSettings()
+    end)
+end
+
+function StylusAnnotations:setStrokeAttribute(strokes, attribute, value)
+    self.store:setAttribute(strokes, attribute, value)
+    self:scheduleSave()
+    UIManager:setDirty(self.view, "partial")
+end
+
+function StylusAnnotations:setStrokeColor(strokes, color)
+    self:setStrokeAttribute(strokes, "color", color)
+end
+
 function StylusAnnotations:chooseStrokeWidth(strokes)
     self:showWidthPicker{
         start = strokes[1].width,
@@ -793,96 +659,100 @@ function StylusAnnotations:chooseStrokeWidth(strokes)
     }
 end
 
-function StylusAnnotations:setStrokeColor(strokes, color)
-    self.store:setField(strokes, "color", color)
-    self:afterStrokeModified(strokes[1])
-end
-
 function StylusAnnotations:setStrokeWidth(strokes, width)
-    self.store:setField(strokes, "width", width)
-    self:afterStrokeModified(strokes[1])
+    self:setStrokeAttribute(strokes, "width", width)
 end
 
-function StylusAnnotations:afterStrokeModified(stroke)
-    self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+function StylusAnnotations:choosePenWidth()
+    self:showWidthPicker{
+        start = self.width,
+        on_apply = function(value)
+            self.width = value
+            self:saveSettings()
+        end,
+    }
 end
 
-function StylusAnnotations:deleteStrokes(strokes, notify)
-    local removed = self.store:remove(strokes)
-    self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
-    if notify ~= false then
-        self:notifyStrokeDeleted(removed)
+function StylusAnnotations:showWidthPicker(opts)
+    local zoom = self:getPageZoom((self:getVisiblePages() or {})[1])
+    local start = opts.start or self.width
+    local on_apply = opts.on_apply
+
+    local index, use_presets = nil, false
+    for i, w in ipairs(WIDTH_CHOICES) do
+        if w == start then index, use_presets = i, true break end
     end
-end
 
-function StylusAnnotations:notifyStrokeDeleted(count)
-    local text
-    if count == 1 then
-        text = _("1 stroke deleted")
-    else
-        text = T(_("%1 strokes deleted"), count)
-    end
-    UIManager:show(InfoMessage:new{
-        text = text,
-        timeout = 2,
+    local spin
+    spin = SpinWidget:new{
+        title_text = _("Width..."),
+        wrap = true,
+        value_table = use_presets and WIDTH_CHOICES or nil,
+        value_index = index,
+        value = start,
+        value_min = MIN_STROKE_WIDTH,
+        value_max = MAX_STROKE_WIDTH,
+        value_step = 1,
+        value_hold_step = 2,
+        precision = "%d",
+        ok_always_enabled = true,
+        extra_text = _("Custom..."),
+        extra_callback = function()
+
+            local input_dialog
+            input_dialog = InputDialog:new{
+                title = _("Custom width"),
+                input_type = "number",
+                input_hint = T(_("%1 - %2 (current: %3)"), MIN_STROKE_WIDTH, MAX_STROKE_WIDTH, start),
+                buttons = {
+                    {
+                        {
+                            text = _("Cancel"),
+                            id = "close",
+                            callback = function()
+                                UIManager:close(input_dialog)
+                            end,
+                        },
+                        {
+                            text = _("OK"),
+                            is_enter_default = true,
+                            callback = function()
+                                local v = tonumber(input_dialog:getInputText())
+                                if v and v >= MIN_STROKE_WIDTH and v <= MAX_STROKE_WIDTH then
+                                    v = math.floor(v + 0.5)
+                                    UIManager:close(input_dialog)
+                                    self:showWidthPicker{
+                                        start = v,
+                                        on_apply = on_apply,
+                                    }
+                                else
+                                    UIManager:show(InfoMessage:new{
+                                        text = T(_("Invalid width (%1 - %2)"), MIN_STROKE_WIDTH, MAX_STROKE_WIDTH),
+                                        timeout = 2,
+                                    })
+                                end
+                            end,
+                        },
+                    },
+                },
+            }
+            UIManager:show(input_dialog)
+        end,
+        callback = function()
+            on_apply(spin.value_widget:getValue())
+        end,
+    }
+
+    local avail_w = spin:getAddedWidgetAvailableWidth()
+    local ph = math.floor(avail_w / 5.2)
+    spin:addWidget(WidthPreview:new{
+        dimen = Geom:new{ w = avail_w, h = ph },
+        get_zoom = function() return zoom end,
+        get_width = function()
+            return spin.value_widget and spin.value_widget:getValue() or start
+        end,
     })
-end
-
-function StylusAnnotations:getStrokesFilePath()
-    local sidecar_dir = self.ui.doc_settings and self.ui.doc_settings.doc_sidecar_dir
-    if sidecar_dir then
-        return sidecar_dir .. "/stylus_annotations.lua", sidecar_dir
-    end
-    return nil
-end
-
-function StylusAnnotations:scheduleSave()
-
-    if self.pending_save then
-        UIManager:unschedule(self.pending_save)
-    end
-    self.pending_save = function()
-        self.pending_save = nil
-        self:saveStrokes()
-    end
-    UIManager:scheduleIn(SAVE_DELAY_MS / 1000, self.pending_save)
-end
-
-function StylusAnnotations:saveStrokes()
-    local filepath, sidecar_dir = self:getStrokesFilePath()
-    if not filepath then
-        logger.warn("StylusAnnotations: no sidecar dir available, skipping save")
-        return
-    end
-    local ok, err = util.makePath(sidecar_dir)
-    if not ok and err then
-        logger.warn("StylusAnnotations: failed to create sidecar dir:", err)
-    end
-    self.store:save(filepath)
-end
-
-function StylusAnnotations:loadStrokes()
-    local filepath = self:getStrokesFilePath()
-    if not filepath then
-        self.store:load(nil)
-        return
-    end
-    local migrated = self.store:load(filepath)
-    if migrated then
-        self:scheduleSave()
-    end
-end
-
-function StylusAnnotations:onStylusAnnotationsToggle()
-    self:setEnabled(not self:isEnabled())
-    local state = self:isEnabled() and _("on") or _("off")
-    UIManager:show(InfoMessage:new{
-        text = T(_("Stylus annotations drawing: %1"), state),
-        timeout = 1,
-    })
-    return true
+    UIManager:show(spin)
 end
 
 function StylusAnnotations:addToMainMenu(menu_items)
@@ -896,12 +766,7 @@ function StylusAnnotations:addToMainMenu(menu_items)
                     return self:isEnabled()
                 end,
                 callback = function()
-                    self:setEnabled(not self:isEnabled())
-                    local state = self:isEnabled() and _("on") or _("off")
-                    UIManager:show(InfoMessage:new{
-                        text = T(_("Stylus annotations drawing: %1"), state),
-                        timeout = 1,
-                    })
+                    self:onStylusAnnotationsToggle()
                 end,
             },
             {
@@ -951,96 +816,56 @@ function StylusAnnotations:addToMainMenu(menu_items)
     }
 end
 
-function StylusAnnotations:choosePenWidth()
-    self:showWidthPicker{
-        start = self.width,
-        on_apply = function(value)
-            self.width = value
-            self:saveSettings()
-        end,
-    }
+function StylusAnnotations:onStylusAnnotationsToggle()
+    self:setEnabled(not self:isEnabled())
+    local state = self:isEnabled() and _("on") or _("off")
+    UIManager:show(InfoMessage:new{
+        text = T(_("Stylus annotations drawing: %1"), state),
+        timeout = 1,
+    })
+    return true
 end
 
-function StylusAnnotations:showWidthPicker(opts)
-    local zoom = self:getPageZoom((self:getVisiblePages() or {})[1])
-    local start = opts.start or self.width
-    local on_apply = opts.on_apply
-
-    local index, use_presets = nil, false
-    for i, w in ipairs(WIDTH_CHOICES) do
-        if w == start then index, use_presets = i, true break end
+function StylusAnnotations:deleteStrokes(strokes, notify)
+    local removed = self.store:remove(strokes)
+    self:scheduleSave()
+    UIManager:setDirty(self.view, "partial")
+    if notify ~= false then
+        self:notifyStrokeDeleted(removed)
     end
+end
 
-    local spin
-    spin = SpinWidget:new{
-        title_text = _("Width..."),
-        wrap = true,
-        value_table = use_presets and WIDTH_CHOICES or nil,
-        value_index = index,
-        value = start,
-        value_min = 1,
-        value_max = 30,
-        value_step = 1,
-        value_hold_step = 2,
-        precision = "%d",
-        ok_always_enabled = true,
-        extra_text = _("Custom..."),
-        extra_callback = function()
+function StylusAnnotations:notifyStrokeDeleted(count)
+    local text
+    if count == 1 then
+        text = _("1 stroke deleted")
+    else
+        text = T(_("%1 strokes deleted"), count)
+    end
+    UIManager:show(InfoMessage:new{
+        text = text,
+        timeout = 2,
+    })
+end
 
-            local input_dialog
-            input_dialog = InputDialog:new{
-                title = _("Custom width"),
-                input_type = "number",
-                input_hint = T(_("%1 - %2 (current: %3)"), 1, 30, start),
-                buttons = {
-                    {
-                        {
-                            text = _("Cancel"),
-                            id = "close",
-                            callback = function()
-                                UIManager:close(input_dialog)
-                            end,
-                        },
-                        {
-                            text = _("OK"),
-                            is_enter_default = true,
-                            callback = function()
-                                local v = tonumber(input_dialog:getInputText())
-                                if v and v >= 1 and v <= 30 then
-                                    v = math.floor(v + 0.5)
-                                    UIManager:close(input_dialog)
-                                    self:showWidthPicker{
-                                        start = v,
-                                        on_apply = on_apply,
-                                    }
-                                else
-                                    UIManager:show(InfoMessage:new{
-                                        text = _("Invalid width (1 - 30)"),
-                                        timeout = 2,
-                                    })
-                                end
-                            end,
-                        },
-                    },
-                },
-            }
-            UIManager:show(input_dialog)
-        end,
-        callback = function()
-            on_apply(spin.value_widget:getValue())
-        end,
-    }
-
-    local avail_w = spin:getAddedWidgetAvailableWidth()
-    local ph = math.floor(avail_w / 5.2)
-    spin:addWidget(WidthPreview:new{
-        dimen = Geom:new{ w = avail_w, h = ph },
-        get_zoom = function() return zoom end,
-        get_width = function()
-            return spin.value_widget and spin.value_widget:getValue() or start
+function StylusAnnotations:confirmDeleteStrokes(text, count, remove)
+    if count == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No strokes to delete."),
+            timeout = 2,
+        })
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text = text,
+        ok_text = _("Delete"),
+        ok_callback = function()
+            local removed = remove()
+            self:scheduleSave()
+            UIManager:setDirty(self.view, "partial")
+            self:notifyStrokeDeleted(removed)
         end,
     })
-    UIManager:show(spin)
 end
 
 function StylusAnnotations:deleteAllStrokesOnPage()
@@ -1050,62 +875,66 @@ function StylusAnnotations:deleteAllStrokesOnPage()
     for _, page in ipairs(pages) do
         count = count + #(self.store.strokes_by_page[page] or {})
     end
-    if count == 0 then
-        UIManager:show(InfoMessage:new{
-            text = _("No strokes to delete."),
-            timeout = 2,
-        })
-        return
-    end
-    UIManager:show(ConfirmBox:new{
-        text = T(_("Delete all %1 strokes on this page?"), count),
-        ok_text = _("Delete"),
-        ok_callback = function()
-            local removed = self.store:removeByPage(pages)
-            self:scheduleSave()
-            UIManager:setDirty(self.view, "partial")
-            self:notifyStrokeDeleted(removed)
-        end,
-    })
+    self:confirmDeleteStrokes(
+        T(_("Delete all %1 strokes on this page?"), count), count,
+        function()
+            return self.store:removeByPage(pages)
+        end)
 end
 
 function StylusAnnotations:deleteAllStrokes()
     local total = #self.store.strokes
-    if total == 0 then
-        UIManager:show(InfoMessage:new{
-            text = _("No strokes to delete."),
-            timeout = 2,
-        })
-        return
-    end
-    UIManager:show(ConfirmBox:new{
-        text = T(_("Delete all %1 strokes for this document?"), total),
-        ok_text = _("Delete"),
-        ok_callback = function()
-            local removed = self.store:removeAll()
-            self:scheduleSave()
-            UIManager:setDirty(self.view, "partial")
-            self:notifyStrokeDeleted(removed)
-        end,
-    })
+    self:confirmDeleteStrokes(
+        T(_("Delete all %1 strokes for this document?"), total), total,
+        function()
+            return self.store:removeAll()
+        end)
 end
 
-function StylusAnnotations:onCloseDocument()
-    if active_plugin == self then
-        active_plugin = nil
+function StylusAnnotations:getStrokesFilePath()
+    local sidecar_dir = self.ui.doc_settings and self.ui.doc_settings.doc_sidecar_dir
+    if sidecar_dir then
+        return sidecar_dir .. "/stylus_annotations.lua", sidecar_dir
     end
+    return nil
+end
+
+function StylusAnnotations:scheduleSave()
+
     if self.pending_save then
         UIManager:unschedule(self.pending_save)
+    end
+    self.pending_save = function()
         self.pending_save = nil
+        self:saveStrokes()
     end
-    if self.hold_timer then
-        UIManager:unschedule(self.hold_timer)
-        self.hold_timer = nil
+    UIManager:scheduleIn(SAVE_DELAY_MS / 1000, self.pending_save)
+end
+
+function StylusAnnotations:saveStrokes()
+    local filepath, sidecar_dir = self:getStrokesFilePath()
+    if not filepath then
+        logger.warn("StylusAnnotations: no sidecar dir available, skipping save")
+        return
     end
-    self.current_stroke = nil
-    self:cancelLive()
-    self:teardownStylusCallback()
-    self:saveStrokes()
+    local ok, err = util.makePath(sidecar_dir)
+    if not ok and err then
+        logger.warn("StylusAnnotations: failed to create sidecar dir:", err)
+    end
+    self.store:save(filepath)
+end
+
+function StylusAnnotations:loadStrokes()
+    local filepath = self:getStrokesFilePath()
+    if not filepath then
+        self.store:load(nil)
+        return
+    end
+    local migrated = self.store:load(filepath)
+    if migrated then
+        self:scheduleSave()
+    end
 end
 
 return StylusAnnotations
+

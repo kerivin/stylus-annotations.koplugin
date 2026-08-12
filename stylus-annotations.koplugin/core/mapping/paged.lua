@@ -1,4 +1,4 @@
-local Base = require("core/adapters/base")
+local Mapping = require("core/mapping/base")
 local Geometry = require("core/geometry")
 local Device = require("device")
 local logger = require("logger")
@@ -10,7 +10,7 @@ local Paged = {}
 local MAPPING_LOG_STATES_PER_STROKE = 3
 
 function Paged:new(plugin)
-    local o = Base:new(plugin)
+    local o = Mapping:new(plugin)
     return setmetatable(o, { __index = Paged })
 end
 
@@ -52,10 +52,6 @@ function Paged:pageToScreenPoint(page, x_p, y_p)
         local sy = st.offset.y + y_p * st.zoom - view.visible_area.y
         return sx, sy
     end
-end
-
-function Paged:pointToScreen(stroke, x_p, y_p)
-    return self:pageToScreenPoint(stroke.page, x_p, y_p)
 end
 
 function Paged:stateSignature(stroke)
@@ -193,6 +189,6 @@ function Paged:deserializeStroke(data)
     return stroke
 end
 
-setmetatable(Paged, { __index = Base })
+setmetatable(Paged, { __index = Mapping })
 
 return Paged

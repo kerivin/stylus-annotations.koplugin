@@ -88,9 +88,9 @@ function StrokeStore:removeAll()
     return removed
 end
 
-function StrokeStore:setField(strokes, field, value)
+function StrokeStore:setAttribute(strokes, attribute, value)
     for _, stroke in ipairs(strokes) do
-        stroke[field] = value
+        stroke[attribute] = value
     end
 end
 
