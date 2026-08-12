@@ -77,7 +77,7 @@ local function installGestureHook()
     if gesture_hook_added then return end
     gesture_hook_added = true
     Input:registerGestureAdjustHook(function(_, ges)
-        if active_plugin and active_plugin:isPenActive() then
+        if active_plugin and active_plugin:isPenActive() and not active_plugin:isOverlayActive() then
             ges.ges = "none"
         end
     end)
@@ -324,15 +324,12 @@ function StylusAnnotations:isOverlayActive()
 end
 
 function StylusAnnotations:onStylusEvent(input, slot)
-
-    if self:isOverlayActive() then return false end
-
-    if not self:isEnabled() then return false end
-
+    local x, y = slot.x or 0, slot.y or 0
     if (slot.tool or TOOL_TYPE_PEN) ~= TOOL_TYPE_PEN then return false end
 
-    local x, y = slot.x or 0, slot.y or 0
     if slot.id and slot.id >= 0 then
+        if self:isOverlayActive() then return false end
+        if not self:isEnabled() then return false end
         if not self.pen_active then
             self.pen_active = true
             logger.info("StylusAnnotations: pen down at", x, y)
@@ -343,19 +340,20 @@ function StylusAnnotations:onStylusEvent(input, slot)
         else
             self:startStroke(x, y)
         end
-    else
-        local was_active = self.pen_active
-        self.pen_active = false
-        self.pen_grace_until = time.now() + time.s(PEN_GRACE_TIME_S)
-        if was_active then
-            logger.info("StylusAnnotations: pen up, grace until", self.pen_grace_until)
-        end
-        if self.current_stroke then
-            self:endStroke()
-        end
+        return true
     end
 
-    return true
+    local was_active = self.pen_active
+    self.pen_active = false
+    self.pen_grace_until = time.now() + time.s(PEN_GRACE_TIME_S)
+    if self.current_stroke then
+        self:endStroke()
+    end
+
+    if not self:isOverlayActive() and self:isEnabled() and was_active then
+        return true
+    end
+    return false
 end
 
 function StylusAnnotations:startStroke(x, y)
