@@ -86,8 +86,6 @@ local PREVIEW_POINTS = {
 
 local WidthPreview = Widget:extend{
     dimen = nil,
-    get_width = function() return 2 end,
-    get_zoom = function() return 1 end,
     padding = 12,
     paintTo = function(self, bb, x, y)
         local w = self:get_width() * self:get_zoom()

@@ -1,11 +1,7 @@
 local Device = require("device")
 local Mapping = require("core/mapping/base")
-local Geometry = require("core/geometry")
-local logger = require("logger")
 
 local Screen = Device.screen
-
-local MAPPING_LOG_STATES_PER_STROKE = 3
 
 local PROBE_MAX_DIST_PX = 900
 
@@ -90,27 +86,7 @@ function Reflow:strokeToScreenPts(stroke)
         spts[i] = b.x + pts[i] * sx
         spts[i + 1] = b.y + pts[i + 1] * sy
     end
-    self:maybeLogStrayMapping(stroke, spts, b)
     return spts
-end
-
-function Reflow:maybeLogStrayMapping(stroke, spts, b)
-    local x0, y0, x1, y1 = Geometry.screenBounds(spts)
-    if not x0 then return end
-    local w, h = Screen:getWidth(), Screen:getHeight()
-    local margin = Screen.scaleBySize and Screen:scaleBySize(8) or 8
-    if x0 < -margin or y0 < -margin or x1 > w + margin or y1 > h + margin or x1 < 0 or y1 < 0 then
-        local logged = stroke.mapping_debug_states or 0
-        if logged < MAPPING_LOG_STATES_PER_STROKE then
-            stroke.mapping_debug_states = logged + 1
-            logger.info(
-                "StylusAnnotations: stray mapping stroke", stroke.id,
-                "anchor", string.format("%q", stroke.anchor.pos0),
-                "bbox", table.concat{tostring(x0), ",", tostring(y0), ",", tostring(x1), ",", tostring(y1)},
-                "screen", w, "x", h,
-                "anchor_box", tostring(b.x), ",", tostring(b.y), ",", tostring(b.w), ",", tostring(b.h))
-        end
-    end
 end
 
 function Reflow:strokeCulled(stroke)

@@ -1,13 +1,6 @@
 local Mapping = require("core/mapping/base")
-local Geometry = require("core/geometry")
-local Device = require("device")
-local logger = require("logger")
-
-local Screen = Device.screen
 
 local Paged = {}
-
-local MAPPING_LOG_STATES_PER_STROKE = 3
 
 function Paged:new(plugin)
     local o = Mapping:new(plugin)
@@ -86,26 +79,7 @@ function Paged:stateSignature(stroke)
     end
 end
 
-function Paged:maybeLogStrayMapping(stroke, spts, seen_key)
-    local x0, y0, x1, y1 = Geometry.screenBounds(spts)
-    if not x0 then return end
-    local w, h = Screen:getWidth(), Screen:getHeight()
-    local margin = Screen.scaleBySize and Screen:scaleBySize(8) or 8
-    if x0 < -margin or y0 < -margin or x1 > w + margin or y1 > h + margin or x1 < 0 or y1 < 0 then
-        local logged = stroke.mapping_debug_states or 0
-        if logged < MAPPING_LOG_STATES_PER_STROKE then
-            stroke.mapping_debug_states = logged + 1
-            logger.info(
-                "StylusAnnotations: stray mapping stroke", stroke.id,
-                "page", stroke.page, "zoom", stroke.zoom,
-                "bbox", table.concat{tostring(x0), ",", tostring(y0), ",", tostring(x1), ",", tostring(y1)},
-                "screen", w, "x", h,
-                "sig", seen_key)
-        end
-    end
-end
-
-function Paged:strokeToScreenPts(stroke)
+function Paged:stateSignature(stroke)
     local pts = stroke.points
     local m = #pts
     if m == 0 then return nil end
@@ -117,7 +91,6 @@ function Paged:strokeToScreenPts(stroke)
         if not sx then return nil end
         spts[i], spts[i + 1] = sx, sy
     end
-    self:maybeLogStrayMapping(stroke, spts, sig)
     return spts
 end
 
