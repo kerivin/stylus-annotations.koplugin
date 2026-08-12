@@ -4,7 +4,7 @@
 
 Hand-drawn stylus annotations for PDF, EPUB, FB2, etc. Tested on Android; if you're lucky, it might also work on Linux-based readers. The plugin supports both paged documents (PDFs) and reflowable ones (EPUBs, FB2s), although they work differently, and in reflowable documents your strokes may shift position.
 
-> **Requirements:** a device with an active stylus and KOReader v2026.07.2-60 or later.
+> **Requirements:** KOReader v2026.07.2-60 (2026.08.12 nightly build) or later.
 
 ## How to install
 
