@@ -24,3 +24,9 @@ You'll find the "Stylus annotations" settings in the second tab of the top menu,
 ## Disclaimer
 
 Still under development. The code is AI-assisted, like, a lot, so beware of the slop.
+
+## TODO
+- Some kind of bookmarks for pages with strokes
+- Write strokes into PDF
+- Stylus pressure?
+- Eraser?
