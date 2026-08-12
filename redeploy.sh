@@ -23,6 +23,57 @@ else
 fi
 
 WIRELESS_SERIAL=$("$ADB" devices 2>/dev/null | awk '/:[0-9]+\s+device/{print $1; exit}')
+
+get_wifi_ip() {
+    serial=$1
+    for iface in wlan0 eth0 wlan1; do
+        ip=$("$ADB" -s "$serial" shell ip addr show "$iface" 2>/dev/null | tr -d '\r' | awk '/inet /{print $2; exit}' | cut -d/ -f1) || true
+        if [ -n "$ip" ]; then
+            echo "$ip"
+            return
+        fi
+    done
+    ip=$("$ADB" -s "$serial" shell getprop dhcp.wlan0.ipaddress 2>/dev/null | tr -d '\r') || true
+    if [ -n "$ip" ]; then
+        echo "$ip"
+        return
+    fi
+    "$ADB" -s "$serial" shell ip addr 2>/dev/null | tr -d '\r' | awk '/inet / && !/127.0.0.1/{print $2; exit}' | cut -d/ -f1 || true
+}
+
+switch_to_wireless() {
+    serial=$1
+    ip=$(get_wifi_ip "$serial")
+    if [ -z "$ip" ]; then
+        echo "Could not determine the device IP address over USB." >&2
+        return 1
+    fi
+    echo "Restarting adbd on $serial over TCP (port 5555)..."
+    "$ADB" -s "$serial" tcpip 5555 >/dev/null 2>&1 || true
+    sleep 2
+    echo "Connecting to $ip:5555..."
+    "$ADB" connect "$ip:5555" >/dev/null 2>&1 || true
+    sleep 1
+    "$ADB" devices 2>/dev/null | awk '/:[0-9]+\s+device/{print $1; exit}'
+}
+
+if [ -z "$WIRELESS_SERIAL" ]; then
+    USB_SERIAL=$("$ADB" devices 2>/dev/null | awk '$2 == "device" && $1 !~ /:[0-9]+$/{print $1; exit}')
+    if [ -z "$USB_SERIAL" ]; then
+        echo "No wireless adb device connected." >&2
+        echo "To switch this device to wireless adb, connect it via USB and re-run redeploy.sh." >&2
+        exit 1
+    fi
+    echo "No wireless adb device connected; found $USB_SERIAL over USB, switching it to wireless adb..."
+    WIRELESS_SERIAL=$(switch_to_wireless "$USB_SERIAL")
+    if [ -z "$WIRELESS_SERIAL" ]; then
+        echo "Failed to switch $USB_SERIAL to wireless adb." >&2
+        echo "Connect the device via USB and re-run redeploy.sh." >&2
+        exit 1
+    fi
+    echo "Switched to wireless adb: $WIRELESS_SERIAL"
+fi
+
 ADB_ARGS=
 if [ -n "$WIRELESS_SERIAL" ]; then
     ADB_ARGS="-s $WIRELESS_SERIAL"
