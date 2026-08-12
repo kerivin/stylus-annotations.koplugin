@@ -26,6 +26,30 @@ local T = require("ffi/util").template
 
 local Screen = Device.screen
 
+local Version = require("version")
+
+local MIN_KOREADER_VERSION = 202607020060 -- nightly v2026.07.2-60-g74f37d14c
+local current_version = Version:getNormalizedCurrentVersion()
+
+if not current_version or current_version < MIN_KOREADER_VERSION then
+    local warned = false
+    local IncompatibleVersion = InputContainer:extend{
+        name = "stylus_annotations",
+        is_doc_only = true,
+        init = function()
+            if warned then return end
+            warned = true
+            UIManager:show(InfoMessage:new{
+                text = T(
+                    _("The Stylus annotations plugin requires KOReader v2026.07.2-60 or later.\nCurrent version: %1"),
+                    Version:getShortVersion()),
+                timeout = 6,
+            })
+        end,
+    }
+    return IncompatibleVersion
+end
+
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
 
 local SAVE_DELAY_MS = 800

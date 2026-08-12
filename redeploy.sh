@@ -48,10 +48,10 @@ switch_to_wireless() {
         echo "Could not determine the device IP address over USB." >&2
         return 1
     fi
-    echo "Restarting adbd on $serial over TCP (port 5555)..."
+    echo "Restarting adbd on $serial over TCP (port 5555)..." >&2
     "$ADB" -s "$serial" tcpip 5555 >/dev/null 2>&1 || true
     sleep 2
-    echo "Connecting to $ip:5555..."
+    echo "Connecting to $ip:5555..." >&2
     "$ADB" connect "$ip:5555" >/dev/null 2>&1 || true
     sleep 1
     "$ADB" devices 2>/dev/null | awk '/:[0-9]+\s+device/{print $1; exit}'
