@@ -114,10 +114,6 @@ function StrokeStore:findStrokeAt(x, y)
     return best
 end
 
-function StrokeStore:getStrokePad(stroke)
-    return math.max(4, math.floor(stroke.width * (stroke.zoom or 1)) + 2)
-end
-
 function StrokeStore:strokesIntersectMid(a, b)
     local mapper = self.mapper
     local as = mapper:strokeToScreenPts(a)
@@ -127,7 +123,7 @@ function StrokeStore:strokesIntersectMid(a, b)
     local bx0, by0, bx1, by1 = Geometry.screenBounds(bs)
     if not ax0 or not bx0 then return false end
     return Geometry.boundsOverlap(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1,
-        self:getStrokePad(a), self:getStrokePad(b))
+        Geometry.strokePad(a.width, a.zoom), Geometry.strokePad(b.width, b.zoom))
 end
 
 function StrokeStore:selectStrokesChain(stroke)
@@ -154,34 +150,8 @@ function StrokeStore:decimatePoints(stroke)
     local spts = self.mapper:strokeToScreenPts(stroke)
     local num = math.floor(#pts / 2)
     if not spts or num <= 2 then return pts end
-    local kept = { pts[1], pts[2] }
-    local kept_s = { spts[1], spts[2] }
-    local lx, ly = kept_s[1], kept_s[2]
-    for i = 2, num - 1 do
-        local xi, yi = pts[2 * i - 1], pts[2 * i]
-        local sx, sy = spts[2 * i - 1], spts[2 * i]
-        local dx, dy = sx - lx, sy - ly
-        if dx * dx + dy * dy >= MIN_SPACING * MIN_SPACING then
-            kept[#kept + 1], kept[#kept + 2] = xi, yi
-            kept_s[#kept_s + 1], kept_s[#kept_s + 2] = sx, sy
-            lx, ly = sx, sy
-        end
-    end
-    kept[#kept + 1], kept[#kept + 2] = pts[#pts - 1], pts[#pts]
-    kept_s[#kept_s + 1], kept_s[#kept_s + 2] = spts[#spts - 1], spts[#spts]
-
-    local num_kept = math.floor(#kept / 2)
-    if num_kept <= 3 then return kept end
     local tol = math.min(3.0, math.max(0.75, self.mapper:getStrokeScreenWidth(stroke) / 4))
-    local idx = Geometry.rdpSimplifyIndices(kept_s, tol)
-    if #idx == num_kept then return kept end
-    local out = {}
-    for p = 1, #idx do
-        local k = idx[p]
-        out[#out + 1] = kept[2 * k - 1]
-        out[#out + 1] = kept[2 * k]
-    end
-    return out
+    return Geometry.simplifyPoints(pts, spts, MIN_SPACING, tol)
 end
 
 function StrokeStore:getStrokeScreenBox(stroke)
@@ -193,7 +163,7 @@ end
 function StrokeStore:getSelectionRect(stroke, width, height)
     local x0, y0, x1, y1 = self:getStrokeScreenBox(stroke)
     if not x0 then return end
-    local rect = Geometry.paddedRect(x0, y0, x1, y1, self:getStrokePad(stroke))
+    local rect = Geometry.paddedRect(x0, y0, x1, y1, Geometry.strokePad(stroke.width, stroke.zoom))
     return Geometry.clampRect(rect.x, rect.y, rect.w, rect.h, width, height)
 end
 

@@ -107,6 +107,41 @@ function Geometry.paddedRect(x0, y0, x1, y1, pad)
     return { x = x, y = y, w = math.abs(x1 - x0) + 2 * pad, h = math.abs(y1 - y0) + 2 * pad }
 end
 
+function Geometry.strokePad(width, zoom)
+    return math.max(4, math.floor(width * (zoom or 1)) + 2)
+end
+
+function Geometry.simplifyPoints(pts, spts, min_spacing, tol)
+    local num = math.floor(#pts / 2)
+    local kept = { pts[1], pts[2] }
+    local kept_s = { spts[1], spts[2] }
+    local lx, ly = kept_s[1], kept_s[2]
+    for i = 2, num - 1 do
+        local xi, yi = pts[2 * i - 1], pts[2 * i]
+        local sx, sy = spts[2 * i - 1], spts[2 * i]
+        local dx, dy = sx - lx, sy - ly
+        if dx * dx + dy * dy >= min_spacing * min_spacing then
+            kept[#kept + 1], kept[#kept + 2] = xi, yi
+            kept_s[#kept_s + 1], kept_s[#kept_s + 2] = sx, sy
+            lx, ly = sx, sy
+        end
+    end
+    kept[#kept + 1], kept[#kept + 2] = pts[#pts - 1], pts[#pts]
+    kept_s[#kept_s + 1], kept_s[#kept_s + 2] = spts[#spts - 1], spts[#spts]
+
+    local num_kept = math.floor(#kept / 2)
+    if num_kept <= 3 then return kept end
+    local idx = Geometry.rdpSimplifyIndices(kept_s, tol)
+    if #idx == num_kept then return kept end
+    local out = {}
+    for p = 1, #idx do
+        local k = idx[p]
+        out[#out + 1] = kept[2 * k - 1]
+        out[#out + 1] = kept[2 * k]
+    end
+    return out
+end
+
 function Geometry.rdpSimplifyIndices(spts, tol)
     local n = math.floor(#spts / 2)
     local keep = {}

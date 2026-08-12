@@ -687,8 +687,7 @@ function StylusAnnotations:showStrokeMenu(strokes)
         anchor = function()
             local x0, y0, x1, y1 = self.store:getSelectionUnionBox(strokes)
             if not x0 then return end
-            local pad = math.max(4, math.floor(strokes[1].width * (strokes[1].zoom or 1)) + 2)
-            return { x = x0 - pad, y = y0 - pad, w = (x1 - x0) + 2 * pad, h = (y1 - y0) + 2 * pad }
+            return Geometry.paddedRect(x0, y0, x1, y1, Geometry.strokePad(strokes[1].width, strokes[1].zoom))
         end,
         tap_close_callback = function()
             self:clearSelection()
