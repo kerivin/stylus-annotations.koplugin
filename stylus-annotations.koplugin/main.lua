@@ -29,9 +29,31 @@ local Screen = Device.screen
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
 
 local SAVE_DELAY_MS = 800
-local HOLD_TIME_S = 0.45
 local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_INTERVAL_MS = 33
+local PEN_GRACE_TIME_S = 1.0
+
+local DEFAULT_HOLD_INTERVAL_MS = 500
+
+local active_plugin = nil
+local gesture_hook_added = false
+
+local function holdIntervalSeconds()
+    local ms = G_reader_settings:readSetting("ges_hold_interval_ms") or DEFAULT_HOLD_INTERVAL_MS
+    return ms / 1000
+end
+
+local function installGestureHook()
+    local Input = Device.input
+    if not Input or not Input.registerGestureAdjustHook then return end
+    if gesture_hook_added then return end
+    gesture_hook_added = true
+    Input:registerGestureAdjustHook(function(_, ges)
+        if active_plugin and active_plugin:isPenActive() then
+            ges.ges = "none"
+        end
+    end)
+end
 
 local DEFAULT_WIDTH = 2
 local DEFAULT_COLOR = "orange"
@@ -81,6 +103,9 @@ local StylusAnnotations = InputContainer:extend{
     touch_pen_fallback_registered = false,
     touch_zones_registered = false,
 
+    pen_active = false,
+    pen_grace_until = 0,
+
     current_stroke = nil,
     pen_x = 0,
     pen_y = 0,
@@ -103,6 +128,7 @@ local StylusAnnotations = InputContainer:extend{
 
 function StylusAnnotations:init()
     self.stroke_id_counter = 0
+    active_plugin = self
 
     self.view = self.ui.view
 
@@ -125,6 +151,7 @@ function StylusAnnotations:init()
     self:setupStylusCallback()
     self:setupPenPanZones()
     self:setupTouchZones()
+    installGestureHook()
 
     dbg:turnOff()
 
@@ -221,6 +248,11 @@ function StylusAnnotations:setupPenPanZones()
     logger.info("StylusAnnotations: pen pan gesture zones registered")
 end
 
+function StylusAnnotations:isPenActive()
+    if self.pen_active then return true end
+    return self.pen_grace_until > 0 and time.now() < self.pen_grace_until
+end
+
 function StylusAnnotations:onPenPan(ges)
     if self.current_stroke then
         if self.stylus_callback_registered then return true end
@@ -228,6 +260,8 @@ function StylusAnnotations:onPenPan(ges)
         self:addStrokePoint(cur.x, cur.y)
         return true
     end
+
+    if not self:isPenActive() then return false end
     if self:isOverlayActive() then return false end
     if not self:isEnabled() then return false end
     if self.stylus_callback_registered then return true end
@@ -247,6 +281,8 @@ function StylusAnnotations:onPenPanRelease(ges)
         end
         return true
     end
+
+    if not self:isPenActive() then return false end
     if self:isOverlayActive() then return false end
     if not self:isEnabled() then return false end
     if self.stylus_callback_registered then return true end
@@ -269,6 +305,10 @@ function StylusAnnotations:onStylusEvent(input, slot)
 
     local x, y = slot.x or 0, slot.y or 0
     if slot.id and slot.id >= 0 then
+        if not self.pen_active then
+            self.pen_active = true
+            logger.info("StylusAnnotations: pen down at", x, y)
+        end
 
         if self.current_stroke then
             self:addStrokePoint(x, y)
@@ -276,7 +316,12 @@ function StylusAnnotations:onStylusEvent(input, slot)
             self:startStroke(x, y)
         end
     else
-
+        local was_active = self.pen_active
+        self.pen_active = false
+        self.pen_grace_until = time.now() + time.s(PEN_GRACE_TIME_S)
+        if was_active then
+            logger.info("StylusAnnotations: pen up, grace until", self.pen_grace_until)
+        end
         if self.current_stroke then
             self:endStroke()
         end
@@ -321,7 +366,7 @@ function StylusAnnotations:startStroke(x, y)
         self:onStrokeHoldTimer()
     end
     self.hold_timer = hold_action
-    UIManager:scheduleIn(HOLD_TIME_S, hold_action)
+    UIManager:scheduleIn(holdIntervalSeconds(), hold_action)
 end
 
 function StylusAnnotations:addStrokePoint(x, y)
@@ -352,11 +397,6 @@ function StylusAnnotations:addStrokePoint(x, y)
     end
 end
 
--- Live ink, throttled: erase the accumulated dirty rect from a clean snapshot
--- taken at stroke start, repaint the whole in-progress stroke with the same
--- renderer used for the final stroke (so color/blending are exact), then flush
--- only that rect to the display with a direct Screen:refreshUI. No widget
--- repaint happens per pen event, which is what kept live drawing laggy.
 function StylusAnnotations:flushLiveThrottled()
     if self.live_ink == false or not self.live_snapshot then return end
     local ld = self.live_dirty
@@ -371,14 +411,19 @@ end
 function StylusAnnotations:flushLive(ld, stroke)
     if not self.live_snapshot then return end
     local bb = Screen.bb
+    local restore = self.dirty_region or ld
     local rx, ry, rw, rh = Geometry.clampRect(
-        ld.x, ld.y, ld.w, ld.h, Screen:getWidth(), Screen:getHeight())
+        restore.x, restore.y, restore.w, restore.h, Screen:getWidth(), Screen:getHeight())
     if not rx then return end
     bb:blitFrom(self.live_snapshot, rx, ry, rx, ry, rw, rh)
     if stroke then
         self:renderStrokeToScreen(stroke)
     end
-    Screen:refreshUI(rx, ry, rw, rh)
+    local dx, dy, dw, dh = Geometry.clampRect(
+        ld.x, ld.y, ld.w, ld.h, Screen:getWidth(), Screen:getHeight())
+    if dx then
+        Screen:refreshUI(dx, dy, dw, dh)
+    end
 end
 
 function StylusAnnotations:cancelLive()
@@ -406,10 +451,6 @@ function StylusAnnotations:endStroke()
 
     self:scheduleSave()
 
-    -- Live ink already painted the buffer while the pen was down, so leave the
-    -- last live frame on screen and touch nothing on pen-up (a re-render would
-    -- re-blend the ink, and a partial refresh can't clear its fast-refresh
-    -- residue). Just flush the tail the throttle may not have painted yet.
     if self.live_ink == false then
         self:cancelLive()
         self:renderStrokeToScreen(stroke)
@@ -417,7 +458,7 @@ function StylusAnnotations:endStroke()
     else
         local ld = self.live_dirty
         if ld and (ld.w > 0 or ld.h > 0) then
-            self:flushLive(ld, stroke)
+            self:flushLive(region or ld, stroke)
         end
         self.live_dirty = nil
         self:cancelLive()
@@ -544,6 +585,7 @@ end
 
 function StylusAnnotations:onStrokeTap(ges)
     if self.current_stroke then return true end
+    if self:isPenActive() then return true end
     if self:isOverlayActive() then return false end
     local stroke = self:findStrokeAt(ges)
     if not stroke then
@@ -556,13 +598,35 @@ end
 
 function StylusAnnotations:onStrokeHold(ges)
     if self.current_stroke then return true end
+    if self:isPenActive() then return true end
     if self:isOverlayActive() then return false end
     local stroke = self:findStrokeAt(ges)
     if not stroke then
 
         return false
     end
-    self:showStrokeMenu(self.store:selectStrokesChain(stroke))
+    local selection = self.store:selectStrokesChain(stroke)
+    if #selection == 1 and #self.store.strokes > 1 then
+        local parts = {}
+        local c0, c1, c2, c3 = Geometry.screenBounds(
+            self.adapter:strokeToScreenPts(stroke) or {})
+        for _, s in ipairs(self.store.strokes) do
+            if s ~= stroke then
+                local a0, a1, a2, a3 = Geometry.screenBounds(
+                    self.adapter:strokeToScreenPts(s) or {})
+                parts[#parts + 1] = string.format(
+                    "%s(page=%s,box=%s,cur_box=%s,intersect=%s)",
+                    tostring(s.id), tostring(s.page),
+                    a0 and string.format("%d,%d,%d,%d", a0, a1, a2, a3) or "nil",
+                    c0 and string.format("%d,%d,%d,%d", c0, c1, c2, c3) or "nil",
+                    tostring(self.store:strokesIntersectMid(stroke, s)))
+            end
+        end
+        logger.warn("StylusAnnotations: hold on", stroke.id,
+            "page", stroke.page, "chain singleton; candidates:",
+            table.concat(parts, " | "))
+    end
+    self:showStrokeMenu(selection)
     return true
 end
 
@@ -1024,6 +1088,9 @@ function StylusAnnotations:deleteAllStrokes()
 end
 
 function StylusAnnotations:onCloseDocument()
+    if active_plugin == self then
+        active_plugin = nil
+    end
     if self.pending_save then
         UIManager:unschedule(self.pending_save)
         self.pending_save = nil
@@ -1039,4 +1106,3 @@ function StylusAnnotations:onCloseDocument()
 end
 
 return StylusAnnotations
-

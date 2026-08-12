@@ -162,10 +162,6 @@ function Paged:strokeCulled(stroke)
     return true
 end
 
-function Paged:strokeSameContext(a, b)
-    return a.page == b.page
-end
-
 function Paged:forEachVisibleStroke(fn)
     local pages = self:getVisiblePages()
     if not pages then return end

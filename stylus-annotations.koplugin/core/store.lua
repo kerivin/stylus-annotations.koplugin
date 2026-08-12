@@ -116,8 +116,7 @@ end
 
 function StrokeStore:strokesIntersectMid(a, b)
     local mapper = self.mapper
-    return mapper:strokeSameContext(a, b)
-        and Geometry.strokesIntersect({ points = mapper:strokeToScreenPts(a) or {} },
+    return Geometry.strokesIntersect({ points = mapper:strokeToScreenPts(a) or {} },
                                       { points = mapper:strokeToScreenPts(b) or {} })
 end
 

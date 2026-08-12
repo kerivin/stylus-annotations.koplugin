@@ -131,10 +131,6 @@ function Reflow:strokeCulled(stroke)
     return dy < cur - vh or dy > cur + 2 * vh
 end
 
-function Reflow:strokeSameContext(a, b)
-    return a.page == b.page
-end
-
 function Reflow:forEachVisibleStroke(fn)
     for _, stroke in ipairs(self.plugin.store.strokes) do
         if not self:strokeCulled(stroke) then
