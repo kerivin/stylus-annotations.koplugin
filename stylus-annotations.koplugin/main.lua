@@ -200,7 +200,7 @@ function StylusAnnotations:loadSettings()
     if saved ~= nil then
         self.live_ink = saved
     else
-        self.live_ink = not Device:hasEinkScreen()
+        self.live_ink = not Device:hasEinkScreen() or Device:isEmulator()
     end
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
     self.color = ds:readSetting("stylus_annotations_color") or DEFAULT_COLOR
