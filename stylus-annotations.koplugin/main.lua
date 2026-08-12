@@ -41,9 +41,9 @@ if not current_version or current_version < MIN_KOREADER_VERSION then
             warned = true
             UIManager:show(InfoMessage:new{
                 text = T(
-                    _("The Stylus annotations plugin requires KOReader v2026.07.2-60 or later.\nCurrent version: %1"),
+                    _("The Stylus annotations plugin requires 202607020060 (nightly) build of KOReader from 2026.08.12 or later.\n"
+                      .. "Current version: %1"),
                     Version:getShortVersion()),
-                timeout = 6,
             })
         end,
     }
