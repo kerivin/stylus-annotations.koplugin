@@ -2,11 +2,6 @@ local Device = require("device")
 local logger = require("logger")
 local time = require("ui/time")
 
-local PenInput = {}
-
-PenInput.current = nil
-local gesture_hook_added = false
-
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
 
 local FULL_SCREEN_ZONE = {
@@ -14,15 +9,25 @@ local FULL_SCREEN_ZONE = {
     ratio_w = 1, ratio_h = 1,
 }
 
-function PenInput:new(plugin)
+local PenInput = {}
+
+PenInput.current = nil
+local gesture_hook_added = false
+
+function PenInput:new(plugin, opts)
+    opts = opts or {}
     local o = {
         plugin = plugin,
         stylus_registered = false,
         pen_active = false,
         pen_grace_until = 0,
-        pen_grace_time = 0,
+        pen_grace_time = opts.pen_grace_time or 0,
     }
     return setmetatable(o, { __index = PenInput })
+end
+
+function PenInput:isPenSlot(slot)
+    return (slot.tool or TOOL_TYPE_PEN) == TOOL_TYPE_PEN
 end
 
 function PenInput:isPenActive()
@@ -91,10 +96,30 @@ function PenInput:registerPanZones()
     })
 end
 
+function PenInput:registerPlatformInput()
+    local Input = Device.input
+    if Input and Input.registerStylusCallback then
+        Input:registerStylusCallback(function(input, slot)
+            return self:onStylusEvent(input, slot)
+        end)
+        self.stylus_registered = true
+    else
+        logger.warn("PenInput: stylus callback API not available")
+    end
+end
+
+function PenInput:unregisterPlatformInput()
+    local Input = Device.input
+    if Input and Input.unregisterStylusCallback then
+        Input:unregisterStylusCallback()
+    end
+    self.stylus_registered = false
+end
+
 function PenInput:onStylusEvent(input, slot)
     local plugin = self.plugin
     local x, y = slot.x or 0, slot.y or 0
-    if (slot.tool or TOOL_TYPE_PEN) ~= TOOL_TYPE_PEN then return false end
+    if not self:isPenSlot(slot) then return false end
 
     if slot.id and slot.id >= 0 then
         if plugin:isOverlayActive() then return false end
@@ -126,10 +151,6 @@ function PenInput:onStylusEvent(input, slot)
     end
     return false
 end
-
-function PenInput:registerPlatformInput() end
-
-function PenInput:unregisterPlatformInput() end
 
 function PenInput:onPenPan(ges)
     local plugin = self.plugin
