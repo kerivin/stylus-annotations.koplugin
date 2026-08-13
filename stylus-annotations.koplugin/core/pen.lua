@@ -136,10 +136,6 @@ function PenInput:onStylusEvent(input, slot)
     local x, y = slot.x or 0, slot.y or 0
     local ret = false
 
-    -- Some platforms mirror the pen as a FINGER-tool event on the pen slot in
-    -- its own frame at pen-up (e.g., SDL3 endPenProximity). The pen slot is
-    -- exclusively ours, so any such event is a mirror artifact: dominate it
-    -- here, at the source, so it never reaches GestureDetector.
     if slot.tool == TOOL_TYPE_FINGER
         and input.pen_slot and slot.slot == input.pen_slot then
         return true
