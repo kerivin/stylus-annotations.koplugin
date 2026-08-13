@@ -23,6 +23,7 @@ function PenInput:new(plugin)
         pen_lift_x = 0,
         pen_lift_y = 0,
         lift_match_radius = 20,
+        pen_mirrored = false,
     }
     return setmetatable(o, { __index = PenInput })
 end
@@ -131,6 +132,25 @@ function PenInput:unregisterPlatformInput()
     self.stylus_registered = false
 end
 
+function PenInput:detectPenMirror(input, x, y)
+    if self.pen_mirrored then return end
+    local gd = input.gesture_detector
+    if not gd or not gd.active_contacts or next(gd.active_contacts) == nil then
+        return
+    end
+    for slot_no, contact in pairs(gd.active_contacts) do
+        if slot_no ~= input.pen_slot then
+            local tev = contact.current_tev
+            if tev and tev.x and tev.y
+                and math.abs(tev.x - x) <= self.lift_match_radius
+                and math.abs(tev.y - y) <= self.lift_match_radius then
+                self.pen_mirrored = true
+                return
+            end
+        end
+    end
+end
+
 function PenInput:onStylusEvent(input, slot)
     local plugin = self.plugin
     local x, y = slot.x or 0, slot.y or 0
@@ -145,8 +165,15 @@ function PenInput:onStylusEvent(input, slot)
         return false
     end
 
+    if not self.pen_mirrored then
+        self:detectPenMirror(input, x, y)
+    end
+
     if slot.id and slot.id >= 0 then
-        if plugin:isOverlayActive() then return false end
+        if self.pen_mirrored and plugin:isOverlayActive() then
+            return true
+        end
+        if not self.pen_active and plugin:isOverlayActive() then return false end
         if not plugin:isEnabled() then return false end
         self.pen_lift_pending = false
         if not self.pen_active then
@@ -155,7 +182,7 @@ function PenInput:onStylusEvent(input, slot)
 
         if plugin.current_stroke then
             plugin:addStrokePoint(x, y)
-        else
+        elseif not plugin:isOverlayActive() then
             self.pen_lift_x = x
             self.pen_lift_y = y
             plugin:startStroke(x, y)
@@ -169,6 +196,10 @@ function PenInput:onStylusEvent(input, slot)
             if was_active then
                 self.pen_lift_pending = true
             end
+        end
+
+        if self.pen_mirrored and plugin:isOverlayActive() then
+            return true
         end
 
         if not plugin:isOverlayActive() and plugin:isEnabled() and was_active then
