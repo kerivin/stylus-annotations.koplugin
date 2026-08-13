@@ -2,6 +2,7 @@ local Device = require("device")
 local logger = require("logger")
 
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
+local TOOL_TYPE_FINGER = Device.input.TOOL_TYPE_FINGER
 
 local FULL_SCREEN_ZONE = {
     ratio_x = 0, ratio_y = 0,
@@ -18,12 +19,20 @@ function PenInput:new(plugin)
         plugin = plugin,
         stylus_registered = false,
         pen_active = false,
+        pen_lift_pending = false,
+        pen_lift_x = 0,
+        pen_lift_y = 0,
+        lift_match_radius = 20,
     }
     return setmetatable(o, { __index = PenInput })
 end
 
-function PenInput:isPenSlot(slot)
+function PenInput:isPenTool(slot)
     return (slot.tool or TOOL_TYPE_PEN) == TOOL_TYPE_PEN
+end
+
+function PenInput:isPenSlot(slot)
+    return self:isPenTool(slot)
 end
 
 function PenInput:isPenActive()
@@ -41,9 +50,18 @@ function PenInput:installGestureHook()
     Input:registerGestureAdjustHook(function(input, ges)
         local pen_input = PenInput.current
         if pen_input
-            and pen_input:isPenActive()
-            and not pen_input.plugin:isOverlayActive() then
+            and not pen_input.plugin:isOverlayActive()
+            and pen_input:isPenActive() then
             ges.ges = "none"
+        elseif pen_input
+            and not pen_input.plugin:isOverlayActive()
+            and pen_input.pen_lift_pending then
+            local dx = math.abs((ges.pos and ges.pos.x or 0) - pen_input.pen_lift_x)
+            local dy = math.abs((ges.pos and ges.pos.y or 0) - pen_input.pen_lift_y)
+            if dx <= pen_input.lift_match_radius and dy <= pen_input.lift_match_radius then
+                ges.ges = "none"
+            end
+            pen_input.pen_lift_pending = false
         end
     end)
 end
@@ -116,11 +134,25 @@ end
 function PenInput:onStylusEvent(input, slot)
     local plugin = self.plugin
     local x, y = slot.x or 0, slot.y or 0
-    if not self:isPenSlot(slot) then return false end
+    local ret = false
+
+    -- Some platforms mirror the pen as a FINGER-tool event on the pen slot in
+    -- its own frame at pen-up (e.g., SDL3 endPenProximity). The pen slot is
+    -- exclusively ours, so any such event is a mirror artifact: dominate it
+    -- here, at the source, so it never reaches GestureDetector.
+    if slot.tool == TOOL_TYPE_FINGER
+        and input.pen_slot and slot.slot == input.pen_slot then
+        return true
+    end
+
+    if not self:isPenSlot(slot) then
+        return false
+    end
 
     if slot.id and slot.id >= 0 then
         if plugin:isOverlayActive() then return false end
         if not plugin:isEnabled() then return false end
+        self.pen_lift_pending = false
         if not self.pen_active then
             self.pen_active = true
         end
@@ -128,21 +160,26 @@ function PenInput:onStylusEvent(input, slot)
         if plugin.current_stroke then
             plugin:addStrokePoint(x, y)
         else
+            self.pen_lift_x = x
+            self.pen_lift_y = y
             plugin:startStroke(x, y)
         end
-        return true
-    end
+        ret = true
+    else
+        local was_active = self.pen_active
+        self.pen_active = false
+        if plugin.current_stroke then
+            plugin:endStroke()
+            if was_active then
+                self.pen_lift_pending = true
+            end
+        end
 
-    local was_active = self.pen_active
-    self.pen_active = false
-    if plugin.current_stroke then
-        plugin:endStroke()
+        if not plugin:isOverlayActive() and plugin:isEnabled() and was_active then
+            ret = true
+        end
     end
-
-    if not plugin:isOverlayActive() and plugin:isEnabled() and was_active then
-        return true
-    end
-    return false
+    return ret
 end
 
 function PenInput:onPenPan(ges)

@@ -79,7 +79,7 @@ function Paged:stateSignature(stroke)
     end
 end
 
-function Paged:stateSignature(stroke)
+function Paged:strokeToScreenPts(stroke)
     local pts = stroke.points
     local m = #pts
     if m == 0 then return nil end
