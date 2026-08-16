@@ -43,23 +43,29 @@ function StrokeStore:rebuildPageIndex()
     end
 end
 
+local function filterStrokes(self, keep)
+    local kept = {}
+    local removed = 0
+    for _, stroke in ipairs(self.strokes) do
+        if keep(stroke) then
+            kept[#kept + 1] = stroke
+        else
+            removed = removed + 1
+        end
+    end
+    self.strokes = kept
+    self:rebuildPageIndex()
+    return removed
+end
+
 function StrokeStore:remove(strokes)
     local to_delete = {}
     for _, stroke in ipairs(strokes) do
         to_delete[stroke] = true
     end
-    local keep = {}
-    local removed = 0
-    for _, stroke in ipairs(self.strokes) do
-        if to_delete[stroke] then
-            removed = removed + 1
-        else
-            keep[#keep + 1] = stroke
-        end
-    end
-    self.strokes = keep
-    self:rebuildPageIndex()
-    return removed
+    return filterStrokes(self, function(stroke)
+        return not to_delete[stroke]
+    end)
 end
 
 function StrokeStore:removeByPage(pages)
@@ -67,25 +73,15 @@ function StrokeStore:removeByPage(pages)
     for _, page in ipairs(pages) do
         page_set[page] = true
     end
-    local keep = {}
-    local removed = 0
-    for _, stroke in ipairs(self.strokes) do
-        if page_set[stroke.page] then
-            removed = removed + 1
-        else
-            keep[#keep + 1] = stroke
-        end
-    end
-    self.strokes = keep
-    self:rebuildPageIndex()
-    return removed
+    return filterStrokes(self, function(stroke)
+        return not page_set[stroke.page]
+    end)
 end
 
 function StrokeStore:removeAll()
-    local removed = #self.strokes
-    self.strokes = {}
-    self:rebuildPageIndex()
-    return removed
+    return filterStrokes(self, function()
+        return false
+    end)
 end
 
 function StrokeStore:setAttribute(strokes, attribute, value)

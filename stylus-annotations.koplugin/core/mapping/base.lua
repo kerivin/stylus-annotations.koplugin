@@ -44,8 +44,12 @@ function Mapping:unpackPoints(pts)
     return points
 end
 
-function Mapping:getPageZoom(page)
-    return self:getZoom(page)
+function Mapping:toScreenPoints(spts, x, y)
+    local sph = {}
+    for i = 1, #spts, 2 do
+        sph[#sph + 1] = { x = x + spts[i], y = y + spts[i + 1] }
+    end
+    return sph
 end
 
 function Mapping:paintStroke(bb, x, y, stroke)
@@ -53,22 +57,14 @@ function Mapping:paintStroke(bb, x, y, stroke)
     local sw = self:getStrokeScreenWidth(stroke)
     local spts = self:strokeToScreenPts(stroke)
     if not spts or #spts == 0 then return end
-    local sph = {}
-    for i = 1, #spts, 2 do
-        sph[#sph + 1] = { x = x + spts[i], y = y + spts[i + 1] }
-    end
-    Draw.paintStrokePath(bb, sph, sw, color)
+    Draw.paintStrokePath(bb, self:toScreenPoints(spts, x, y), sw, color)
 end
 
 function Mapping:paintStrokeSolid(bb, x, y, stroke, color)
     local sw = self:getStrokeScreenWidth(stroke)
     local spts = self:strokeToScreenPts(stroke)
     if not spts or #spts == 0 then return end
-    local sph = {}
-    for i = 1, #spts, 2 do
-        sph[#sph + 1] = { x = x + spts[i], y = y + spts[i + 1] }
-    end
-    Draw.paintStrokeSolid(bb, sph, sw, color)
+    Draw.paintStrokeSolid(bb, self:toScreenPoints(spts, x, y), sw, color)
 end
 
 function Mapping:renderStrokeToScreen(stroke)

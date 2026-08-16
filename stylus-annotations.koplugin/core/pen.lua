@@ -32,10 +32,6 @@ function PenInput:isPenTool(slot)
     return (slot.tool or TOOL_TYPE_PEN) == TOOL_TYPE_PEN
 end
 
-function PenInput:isPenSlot(slot)
-    return self:isPenTool(slot)
-end
-
 function PenInput:isPenActive()
     return self.pen_active
 end
@@ -161,7 +157,7 @@ function PenInput:onStylusEvent(input, slot)
         return true
     end
 
-    if not self:isPenSlot(slot) then
+    if not self:isPenTool(slot) then
         return false
     end
 

@@ -19,7 +19,6 @@ local Widget = require("ui/widget/widget")
 local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
-local dbg = require("dbg")
 local util = require("util")
 local time = require("ui/time")
 local _ = require("gettext")
@@ -155,8 +154,6 @@ function StylusAnnotations:init()
     self.pen_input = PenInput:new(self)
     self.pen_input:register()
     self:setupTouchZones()
-
-    dbg:turnOff()
 
     logger.info("StylusAnnotations: initialized, strokes =", #self.store.strokes)
 end
@@ -393,7 +390,6 @@ function StylusAnnotations:endStroke()
     self:scheduleSave()
 
     if self.live_ink == false then
-        self:cancelLive()
         self:renderStrokeToScreen(stroke)
         self:refreshRegion(region)
     else
@@ -401,8 +397,8 @@ function StylusAnnotations:endStroke()
         if ld and (ld.w > 0 or ld.h > 0) then
             self:flushLive(region or ld, stroke)
         end
-        self:cancelLive()
     end
+    self:cancelLive()
 end
 
 function StylusAnnotations:flushLiveThrottled()
@@ -419,6 +415,8 @@ end
 function StylusAnnotations:flushLive(ld, stroke)
     if not self.live_snapshot then return end
     local bb = Screen.bb
+    -- Restore the pre-stroke snapshot over the whole accumulated dirty region,
+    -- then re-render the full stroke; only the delta region needs a screen refresh.
     local restore = self.dirty_region or ld
     local rx, ry, rw, rh = Geometry.clampRect(
         restore.x, restore.y, restore.w, restore.h, Screen:getWidth(), Screen:getHeight())
@@ -473,7 +471,7 @@ function StylusAnnotations:getVisiblePages()
 end
 
 function StylusAnnotations:getPageZoom(page)
-    return self.mapper:getPageZoom(page)
+    return self.mapper:getZoom(page)
 end
 
 function StylusAnnotations:getSelectionRect(stroke, width, height)

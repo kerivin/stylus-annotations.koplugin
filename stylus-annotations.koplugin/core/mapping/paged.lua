@@ -25,58 +25,48 @@ function Paged:addPoint(stroke, x, y)
     return true
 end
 
-function Paged:pageToScreenPoint(page, x_p, y_p)
+function Paged:pageState(page)
     local view = self.view
-    if view.page_scroll then
-        local acc_y = 0
-        for _, state in ipairs(view.page_states) do
-            if state.page == page then
-                local sx = state.offset.x + x_p * state.zoom - state.visible_area.x
-                local sy = acc_y + state.offset.y + y_p * state.zoom - state.visible_area.y
-                return sx, sy
-            end
-            acc_y = acc_y + state.visible_area.h + view.page_gap.height
+    if not view.page_scroll then
+        local st = view.state
+        if st and st.page == page then
+            return st, view.visible_area
         end
         return nil
-    else
-        local st = view.state
-        if not st or st.page ~= page then return nil end
-        local sx = st.offset.x + x_p * st.zoom - view.visible_area.x
-        local sy = st.offset.y + y_p * st.zoom - view.visible_area.y
-        return sx, sy
     end
+    local acc_y = 0
+    for _, state in ipairs(view.page_states) do
+        if state.page == page then
+            return state, state.visible_area, acc_y
+        end
+        acc_y = acc_y + state.visible_area.h + view.page_gap.height
+    end
+    return nil
+end
+
+function Paged:pageToScreenPoint(page, x_p, y_p)
+    local state, visible_area, acc_y = self:pageState(page)
+    if not state then return nil end
+    local sx = state.offset.x + x_p * state.zoom - visible_area.x
+    local sy = (acc_y or 0) + state.offset.y + y_p * state.zoom - visible_area.y
+    return sx, sy
 end
 
 function Paged:stateSignature(stroke)
     local view = self.view
-    local page = stroke.page
+    local state, visible_area, acc_y = self:pageState(stroke.page)
+    if not state then return nil end
+    local signature = table.concat{
+        "rot=", tostring(state.rotation),
+        "|zoom=", tostring(state.zoom),
+        "|off=", tostring(state.offset.x), ",", tostring(state.offset.y),
+        "|vis=", tostring(visible_area.x), ",", tostring(visible_area.y),
+        ",", tostring(visible_area.w), ",", tostring(visible_area.h),
+    }
     if view.page_scroll then
-        local acc_y = 0
-        for _, state in ipairs(view.page_states) do
-            if state.page == page then
-                return table.concat{
-                    "rot=", tostring(state.rotation),
-                    "|zoom=", tostring(state.zoom),
-                    "|off=", tostring(state.offset.x), ",", tostring(state.offset.y),
-                    "|vis=", tostring(state.visible_area.x), ",", tostring(state.visible_area.y),
-                    ",", tostring(state.visible_area.w), ",", tostring(state.visible_area.h),
-                    "|acc=", tostring(acc_y),
-                }
-            end
-            acc_y = acc_y + state.visible_area.h + view.page_gap.height
-        end
-        return nil
-    else
-        local st = view.state
-        if not st or st.page ~= page then return nil end
-        return table.concat{
-            "rot=", tostring(st.rotation),
-            "|zoom=", tostring(st.zoom),
-            "|off=", tostring(st.offset.x), ",", tostring(st.offset.y),
-            "|vis=", tostring(view.visible_area.x), ",", tostring(view.visible_area.y),
-            ",", tostring(view.visible_area.w), ",", tostring(view.visible_area.h),
-        }
+        return signature .. "|acc=" .. tostring(acc_y)
     end
+    return signature
 end
 
 function Paged:strokeToScreenPts(stroke)
@@ -109,17 +99,8 @@ function Paged:getVisiblePages()
 end
 
 function Paged:getZoom(page)
-    local view = self.view
-    if view.page_scroll then
-        for _, state in ipairs(view.page_states) do
-            if state.page == page then
-                return state.zoom or 1
-            end
-        end
-        return 1
-    else
-        return view.state and view.state.zoom or 1
-    end
+    local state = self:pageState(page)
+    return state and state.zoom or 1
 end
 
 function Paged:strokeCulled(stroke)
