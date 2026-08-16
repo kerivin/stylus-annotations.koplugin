@@ -9,7 +9,7 @@ Hand-drawn stylus annotations for PDF, EPUB, FB2, etc. Tested on Android; if you
 ## How to install
 
 - Use a plugin manager (AppStore, Storefront, etc.) and search for "stylus-annotations".
-- Or download the zip from the Releases page, unzip it, and put the entire `stylus-annotations.koplugin` folder into the `koreader/plugins` directory, so you end up with the path `koreader/plugins/stylus-annotations.koplugin`.
+- Or download the zip from the Releases page, unzip it, and put the entire `stylus-annotations.koplugin` folder into the `koreader/plugins` directory, so you end up with the path `koreader/plugins/stylus-annotations.koplugin` with the plugin files. It should NOT be `koreader/plugins/stylus-annotations.koplugin/stylus-annotations.koplugin`.
 
 You'll find the "Stylus annotations" settings in the second tab of the top menu, next to "Highlights".
 
