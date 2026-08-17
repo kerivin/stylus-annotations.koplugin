@@ -52,29 +52,11 @@ function Paged:pageToScreenPoint(page, x_p, y_p)
     return sx, sy
 end
 
-function Paged:stateSignature(stroke)
-    local view = self.view
-    local state, visible_area, acc_y = self:pageState(stroke.page)
-    if not state then return nil end
-    local signature = table.concat{
-        "rot=", tostring(state.rotation),
-        "|zoom=", tostring(state.zoom),
-        "|off=", tostring(state.offset.x), ",", tostring(state.offset.y),
-        "|vis=", tostring(visible_area.x), ",", tostring(visible_area.y),
-        ",", tostring(visible_area.w), ",", tostring(visible_area.h),
-    }
-    if view.page_scroll then
-        return signature .. "|acc=" .. tostring(acc_y)
-    end
-    return signature
-end
-
 function Paged:strokeToScreenPts(stroke)
     local pts = stroke.points
     local m = #pts
     if m == 0 then return nil end
-    local sig = self:stateSignature(stroke)
-    if not sig then return nil end
+    if not self:pageState(stroke.page) then return nil end
     local spts = {}
     for i = 1, m, 2 do
         local sx, sy = self:pageToScreenPoint(stroke.page, pts[i], pts[i + 1])

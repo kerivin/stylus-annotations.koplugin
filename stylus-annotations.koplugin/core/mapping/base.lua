@@ -34,12 +34,7 @@ function Mapping:unpackPoints(pts)
     if not pts or type(pts[1]) == "table" then return nil end
     local points = {}
     for i = 1, #pts do
-        local v = pts[i]
-        if type(v) == "table" then
-            points[i] = Geometry.unpack(v[1])
-        else
-            points[i] = Geometry.unpack(v)
-        end
+        points[i] = Geometry.unpack(pts[i])
     end
     return points
 end
@@ -52,18 +47,23 @@ function Mapping:toScreenPoints(spts, x, y)
     return sph
 end
 
-function Mapping:paintStroke(bb, x, y, stroke)
-    local color = Draw.getRenderColor(stroke, self.ui.highlight)
+function Mapping:strokeRenderData(stroke)
     local sw = self:getStrokeScreenWidth(stroke)
     local spts = self:strokeToScreenPts(stroke)
     if not spts or #spts == 0 then return end
+    return sw, spts
+end
+
+function Mapping:paintStroke(bb, x, y, stroke)
+    local color = Draw.getRenderColor(stroke, self.ui.highlight)
+    local sw, spts = self:strokeRenderData(stroke)
+    if not spts then return end
     Draw.paintStrokePath(bb, self:toScreenPoints(spts, x, y), sw, color)
 end
 
 function Mapping:paintStrokeSolid(bb, x, y, stroke, color)
-    local sw = self:getStrokeScreenWidth(stroke)
-    local spts = self:strokeToScreenPts(stroke)
-    if not spts or #spts == 0 then return end
+    local sw, spts = self:strokeRenderData(stroke)
+    if not spts then return end
     Draw.paintStrokeSolid(bb, self:toScreenPoints(spts, x, y), sw, color)
 end
 

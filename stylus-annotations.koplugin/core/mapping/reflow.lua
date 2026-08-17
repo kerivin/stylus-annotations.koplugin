@@ -3,8 +3,6 @@ local Mapping = require("core/mapping/base")
 
 local Screen = Device.screen
 
-local PROBE_MAX_DIST_PX = 900
-
 local Reflow = {}
 
 function Reflow:new(plugin)
@@ -24,12 +22,7 @@ function Reflow:probeWord(x, y)
             or doc:getNearestWordAndBoxFromPosition({ x = x, y = y }, 1)
     end
     if wordbox and wordbox.pos0 and wordbox.pos1 and wordbox.sbox then
-        local cx = wordbox.sbox.x + wordbox.sbox.w / 2
-        local cy = wordbox.sbox.y + wordbox.sbox.h / 2
-        local dx, dy = cx - x, cy - y
-        if dx * dx + dy * dy <= PROBE_MAX_DIST_PX * PROBE_MAX_DIST_PX then
-            return wordbox
-        end
+        return wordbox
     end
     return nil
 end

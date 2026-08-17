@@ -2,6 +2,24 @@ local Geometry = {}
 
 local COORD_SCALE = 4
 
+Geometry.ROTATION_UPRIGHT = 0
+Geometry.ROTATION_CLOCKWISE = 1
+Geometry.ROTATION_UPSIDE_DOWN = 2
+Geometry.ROTATION_COUNTER_CLOCKWISE = 3
+
+function Geometry.transformForRotation(x, y, rotation, screen_width, screen_height)
+    if rotation == Geometry.ROTATION_UPRIGHT then
+        return x, y
+    elseif rotation == Geometry.ROTATION_CLOCKWISE then
+        return screen_width - y, x
+    elseif rotation == Geometry.ROTATION_UPSIDE_DOWN then
+        return screen_width - x, screen_height - y
+    elseif rotation == Geometry.ROTATION_COUNTER_CLOCKWISE then
+        return y, screen_height - x
+    end
+    return x, y
+end
+
 function Geometry.pack(v)
     return math.floor(v * COORD_SCALE + 0.5)
 end

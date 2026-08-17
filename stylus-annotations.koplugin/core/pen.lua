@@ -1,7 +1,11 @@
 local Device = require("device")
+local Geometry = require("core/geometry")
 local logger = require("logger")
+local PenFallback = require("core/pen_fallback")
 
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
+local TOOL_TYPE_ERASER = Device.input.TOOL_TYPE_ERASER
+local TOOL_TYPE_HIGHLIGHTER = Device.input.TOOL_TYPE_HIGHLIGHTER
 local TOOL_TYPE_FINGER = Device.input.TOOL_TYPE_FINGER
 
 local FULL_SCREEN_ZONE = {
@@ -24,12 +28,23 @@ function PenInput:new(plugin)
         pen_lift_y = 0,
         lift_match_radius = 20,
         pen_mirrored = false,
+        eraser_active = false,
+        fallback = nil,
     }
     return setmetatable(o, { __index = PenInput })
 end
 
 function PenInput:isPenTool(slot)
-    return (slot.tool or TOOL_TYPE_PEN) == TOOL_TYPE_PEN
+    local tool = slot.tool or TOOL_TYPE_PEN
+    return tool == TOOL_TYPE_PEN
+        or tool == TOOL_TYPE_ERASER
+        or tool == TOOL_TYPE_HIGHLIGHTER
+end
+
+function PenInput:transformCoordinates(x, y)
+    local Screen = Device.screen
+    return Geometry.transformForRotation(
+        x, y, Screen:getTouchRotation(), Screen:getWidth(), Screen:getHeight())
 end
 
 function PenInput:isPenActive()
@@ -67,11 +82,13 @@ function PenInput:register()
     self:installGestureHook()
     PenInput.current = self
     self:registerPanZones()
+    self:installFallbackHook()
     self:registerPlatformInput()
 end
 
 function PenInput:unregister()
     self:unregisterPlatformInput()
+    self:cleanupFallbackHook()
     if PenInput.current == self then
         PenInput.current = nil
     end
@@ -128,6 +145,21 @@ function PenInput:unregisterPlatformInput()
     self.stylus_registered = false
 end
 
+function PenInput:installFallbackHook()
+    if self.fallback then return end
+    local Input = Device.input
+    if not Input or not Input.gesture_detector then return end
+    self.fallback = PenFallback:new(self)
+    self.fallback:install()
+end
+
+function PenInput:cleanupFallbackHook()
+    if self.fallback then
+        self.fallback:cleanup()
+        self.fallback = nil
+    end
+end
+
 function PenInput:detectPenMirror(input, x, y)
     if self.pen_mirrored then return end
     local gd = input.gesture_detector
@@ -149,8 +181,13 @@ end
 
 function PenInput:onStylusEvent(input, slot)
     local plugin = self.plugin
-    local x, y = slot.x or 0, slot.y or 0
+    local x, y = self:transformCoordinates(slot.x or 0, slot.y or 0)
     local ret = false
+
+    logger.dbg("PenInput:onStylusEvent",
+        "slot=", slot.slot, "tool=", slot.tool, "id=", slot.id,
+        "raw=", slot.x, slot.y, "pos=", x, y,
+        "eraser=", self.eraser_active)
 
     if slot.tool == TOOL_TYPE_FINGER
         and input.pen_slot and slot.slot == input.pen_slot then
@@ -161,8 +198,12 @@ function PenInput:onStylusEvent(input, slot)
         return false
     end
 
+    if slot.tool == TOOL_TYPE_ERASER then
+        return self:onEraserEvent(x, y, slot.id or -1)
+    end
+
     if not self.pen_mirrored then
-        self:detectPenMirror(input, x, y)
+        self:detectPenMirror(input, slot.x or x, slot.y or y)
     end
 
     if slot.id and slot.id >= 0 then
@@ -203,6 +244,19 @@ function PenInput:onStylusEvent(input, slot)
         end
     end
     return ret
+end
+
+function PenInput:onEraserEvent(x, y, id)
+    local plugin = self.plugin
+    if plugin:isOverlayActive() then return false end
+    if id >= 0 then
+        self.eraser_active = true
+        plugin:eraseStrokeAt(x, y)
+        return true
+    else
+        self.eraser_active = false
+        return true
+    end
 end
 
 function PenInput:onPenPan(ges)

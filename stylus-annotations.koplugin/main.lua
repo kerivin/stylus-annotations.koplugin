@@ -830,6 +830,15 @@ function StylusAnnotations:deleteStrokes(strokes, notify)
     end
 end
 
+function StylusAnnotations:eraseStrokeAt(x, y)
+    local removed = self.store:eraseAt(x, y)
+    if removed > 0 then
+        self:scheduleSave()
+        UIManager:setDirty(self.view, "partial")
+    end
+    return removed
+end
+
 function StylusAnnotations:notifyStrokeDeleted(count)
     local text
     if count == 1 then

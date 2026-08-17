@@ -110,6 +110,12 @@ function StrokeStore:findStrokeAt(x, y)
     return best
 end
 
+function StrokeStore:eraseAt(x, y)
+    local stroke = self:findStrokeAt(x, y)
+    if not stroke then return 0 end
+    return self:remove({ stroke })
+end
+
 function StrokeStore:strokesIntersectMid(a, b)
     local mapper = self.mapper
     local as = mapper:strokeToScreenPts(a)
@@ -123,6 +129,7 @@ function StrokeStore:strokesIntersectMid(a, b)
 end
 
 function StrokeStore:selectStrokesChain(stroke)
+    local page = stroke.page
     local selection = { stroke }
     local seen = { [stroke] = true }
     local queue = { stroke }
@@ -130,7 +137,8 @@ function StrokeStore:selectStrokesChain(stroke)
     while i <= #queue do
         local cur = queue[i]
         i = i + 1
-        for _, s in ipairs(self.strokes) do
+        for _, idx in ipairs(self.strokes_by_page[page] or {}) do
+            local s = self.strokes[idx]
             if not seen[s] and self:strokesIntersectMid(cur, s) then
                 seen[s] = true
                 selection[#selection + 1] = s
