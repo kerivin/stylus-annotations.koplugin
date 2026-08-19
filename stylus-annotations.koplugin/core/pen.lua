@@ -22,7 +22,6 @@ function PenInput:new(plugin)
         pen_lift_x = 0,
         pen_lift_y = 0,
         lift_match_radius = 20,
-        pen_mirrored = false,
         eraser_active = false,
     }
     return setmetatable(o, { __index = PenInput })
@@ -77,18 +76,13 @@ function PenInput:installEventHook()
     local pen_slot_down = false
     Input:registerEventAdjustHook(function(input, ev)
         if ev.type ~= C.EV_ABS then return end
+        if not input.pen_slot then return end
         if ev.code == C.ABS_MT_SLOT then
             current_slot = ev.value
-            return
-        end
-        if input.pen_slot and current_slot == input.pen_slot
-            and ev.code == C.ABS_MT_TRACKING_ID then
-            pen_slot_down = ev.value >= 0
-            return
-        end
-        if ev.code == C.ABS_MT_TRACKING_ID and ev.value >= 0
-            and input.pen_slot and current_slot ~= input.pen_slot then
-            if pen_slot_down then
+        elseif ev.code == C.ABS_MT_TRACKING_ID then
+            if current_slot == input.pen_slot then
+                pen_slot_down = ev.value >= 0
+            elseif ev.value >= 0 and pen_slot_down then
                 -- Drop the touchscreen mirror of the pen before it reaches the
                 -- GestureDetector (it would otherwise mirror every gesture).
                 logger.dbg("PenInput: dropped mirror contact in slot", current_slot)
@@ -130,25 +124,6 @@ function PenInput:unregisterPlatformInput()
     end
 end
 
-function PenInput:detectPenMirror(input, x, y)
-    if self.pen_mirrored then return end
-    local gd = input.gesture_detector
-    if not gd or not gd.active_contacts or next(gd.active_contacts) == nil then
-        return
-    end
-    for slot_no, contact in pairs(gd.active_contacts) do
-        if slot_no ~= input.pen_slot then
-            local tev = contact.current_tev
-            if tev and tev.x and tev.y
-                and math.abs(tev.x - x) <= self.lift_match_radius
-                and math.abs(tev.y - y) <= self.lift_match_radius then
-                self.pen_mirrored = true
-                return
-            end
-        end
-    end
-end
-
 function PenInput:onStylusEvent(input, slot)
     local plugin = self.plugin
     local x, y = self:transformCoordinates(slot.x or 0, slot.y or 0)
@@ -157,7 +132,7 @@ function PenInput:onStylusEvent(input, slot)
     logger.dbg("PenInput:onStylusEvent",
         "slot=", slot.slot, "tool=", slot.tool, "id=", slot.id,
         "raw=", slot.x, slot.y, "pos=", x, y,
-        "eraser=", self.eraser_active, "mirrored=", self.pen_mirrored)
+        "eraser=", self.eraser_active)
 
     if slot.tool == TOOL_TYPE_FINGER
         and input.pen_slot and slot.slot == input.pen_slot then
@@ -180,10 +155,6 @@ function PenInput:onStylusEvent(input, slot)
 
     if slot.tool == TOOL_TYPE_ERASER then
         return self:onEraserEvent(x, y, slot.id or -1)
-    end
-
-    if not self.pen_mirrored then
-        self:detectPenMirror(input, slot.x or x, slot.y or y)
     end
 
     if slot.id and slot.id >= 0 then
