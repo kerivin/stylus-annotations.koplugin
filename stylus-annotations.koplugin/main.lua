@@ -57,6 +57,9 @@ local FAST_LIVE_REFRESH_INTERVAL_MS = 80
 local MAX_LIVE_REFRESH_INTERVAL_MS = 150
 local LIVE_MOVE_THRESHOLD_PX = 2
 local LIVE_MOVE_THRESHOLD_PX2 = LIVE_MOVE_THRESHOLD_PX * LIVE_MOVE_THRESHOLD_PX
+local LIVE_MODE_DEFERRED = "deferred"
+local LIVE_MODE_ACCURATE = "live_accurate"
+local LIVE_MODE_FAST = "live_fast"
 local DEFAULT_HOLD_INTERVAL_MS = 500
 
 local MIN_STROKE_WIDTH = 1
@@ -131,8 +134,7 @@ local StylusAnnotations = InputContainer:extend{
     selection_backup_x = 0,
     selection_backup_y = 0,
     dirty_region = nil,
-    live_ink = true,
-    fast_ink = false,
+    live_mode = LIVE_MODE_ACCURATE,
     live_snapshot = nil,
     live_dirty = nil,
     last_refresh_time = 0,
@@ -165,8 +167,7 @@ function StylusAnnotations:init()
     self:setupTouchZones()
 
     logger.info("StylusAnnotations: initialized, strokes =", #self.store.strokes,
-        "eink =", Device:hasEinkScreen(), "fast_ink =", self.fast_ink,
-        "live_ink =", self.live_ink)
+        "eink =", Device:hasEinkScreen(), "live_mode =", self.live_mode)
 end
 
 function StylusAnnotations:onReaderReady()
@@ -194,22 +195,35 @@ function StylusAnnotations:setEnabled(enabled)
     G_reader_settings:saveSetting("stylus_annotations_enabled", enabled)
 end
 
+function StylusAnnotations:liveInkEnabled()
+    return self.live_mode ~= LIVE_MODE_DEFERRED
+end
+
+function StylusAnnotations:updateLiveMode(enabled)
+    if enabled then
+        self.live_mode = Device:hasEinkScreen() and LIVE_MODE_FAST or LIVE_MODE_ACCURATE
+    else
+        self.live_mode = LIVE_MODE_DEFERRED
+    end
+end
+
 function StylusAnnotations:loadSettings()
     local ds = self.ui.doc_settings
     local saved = ds:readSetting("stylus_annotations_live_ink")
+    local enabled
     if saved ~= nil then
-        self.live_ink = saved
+        enabled = saved
     else
-        self.live_ink = not Device:hasEinkScreen() or Device:isEmulator()
+        enabled = not Device:hasEinkScreen() or Device:isEmulator()
     end
-    self.fast_ink = Device:hasEinkScreen()
+    self:updateLiveMode(enabled)
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
     self.color = ds:readSetting("stylus_annotations_color") or DEFAULT_COLOR
 end
 
 function StylusAnnotations:saveSettings()
     local ds = self.ui.doc_settings
-    ds:saveSetting("stylus_annotations_live_ink", self.live_ink ~= false)
+    ds:saveSetting("stylus_annotations_live_ink", self:liveInkEnabled())
     ds:saveSetting("stylus_annotations_width", self.width)
     ds:saveSetting("stylus_annotations_color", self.color)
 end
@@ -321,12 +335,9 @@ function StylusAnnotations:startStroke(x, y)
         finalize_ms = 0,
     }
 
-    if self.live_ink ~= false then
+    if self.live_mode ~= LIVE_MODE_DEFERRED then
         self:takeLiveSnapshot()
-        if self.fast_ink then
-            -- Stamp the pen-down dot into the framebuffer, but don't post a
-            -- refresh yet: the first movement flush (or the pen-up finalize)
-            -- will push it to the screen, saving a full-screen post per stroke.
+        if self.live_mode == LIVE_MODE_FAST then
             local sw = self:getStrokeScreenWidth(stroke)
             Draw.stampDisc(Screen.bb, x, y, sw / 2, Blitbuffer.COLOR_BLACK)
         end
@@ -347,7 +358,7 @@ function StylusAnnotations:addStrokePoint(x, y)
     local seg_y = math.min(self.pen_y, y) - pad
     local seg_w = math.abs(x - self.pen_x) + 2 * pad
     local seg_h = math.abs(y - self.pen_y) + 2 * pad
-    if self.live_ink ~= false and self.fast_ink then
+    if self.live_mode == LIVE_MODE_FAST then
         self:stampLiveSegment(stroke, x, y, sw)
     end
     self:accumulateSegment(seg_x, seg_y, seg_w, seg_h)
@@ -387,7 +398,7 @@ end
 
 function StylusAnnotations:accumulateSegment(x, y, w, h)
     self.dirty_region = Geometry.mergeRect(self.dirty_region, x, y, w, h)
-    if self.live_ink ~= false then
+    if self.live_mode ~= LIVE_MODE_DEFERRED then
         self.live_dirty = Geometry.mergeRect(self.live_dirty, x, y, w, h)
         self:flushLiveThrottled()
     end
@@ -444,10 +455,10 @@ function StylusAnnotations:endStroke()
 
     self:scheduleSave()
 
-    if self.live_ink == false then
+    if self.live_mode == LIVE_MODE_DEFERRED then
         self:renderStrokeToScreen(stroke)
         self:refreshRegion(region)
-    elseif self.fast_ink then
+    elseif self.live_mode == LIVE_MODE_FAST then
         self:finalizeLiveStroke(stroke, region or self.live_dirty)
     else
         local ld = self.live_dirty
@@ -490,7 +501,7 @@ end
 
 function StylusAnnotations:liveRefreshInterval()
     local interval = LIVE_REFRESH_INTERVAL_MS
-    if self.fast_ink then
+    if self.live_mode == LIVE_MODE_FAST then
         interval = FAST_LIVE_REFRESH_INTERVAL_MS
     end
     if self.live_flush_ms then
@@ -500,7 +511,7 @@ function StylusAnnotations:liveRefreshInterval()
 end
 
 function StylusAnnotations:flushLiveThrottled()
-    if self.live_ink == false or not self.live_snapshot then return end
+    if self.live_mode == LIVE_MODE_DEFERRED or not self.live_snapshot then return end
     local ld = self.live_dirty
     if not ld or ld.w <= 0 or ld.h <= 0 then return end
     local now = time.now()
@@ -516,7 +527,7 @@ end
 
 function StylusAnnotations:flushLive(ld, stroke)
     if not self.live_snapshot then return end
-    if self.fast_ink then
+    if self.live_mode == LIVE_MODE_FAST then
         local t0 = time.now()
         local dx, dy, dw, dh = clampToScreen(ld.x, ld.y, ld.w, ld.h)
         if dx then
@@ -882,12 +893,12 @@ function StylusAnnotations:addToMainMenu(menu_items)
             {
                 text = _("Live refresh"),
                 checked_func = function()
-                    return self.live_ink ~= false
+                    return self:liveInkEnabled()
                 end,
                 callback = function()
-                    self.live_ink = (self.live_ink == false)
+                    self:updateLiveMode(self.live_mode == LIVE_MODE_DEFERRED)
                     self:saveSettings()
-                    local state = self.live_ink and _("on") or _("off")
+                    local state = self.live_mode == LIVE_MODE_DEFERRED and _("off") or _("on")
                     UIManager:show(InfoMessage:new{
                         text = T(_("Live refresh: %1"), state),
                         timeout = 1,
