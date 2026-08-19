@@ -1,5 +1,6 @@
 local Device = require("device")
 local Geometry = require("core/geometry")
+local ffi = require("ffi")
 local logger = require("logger")
 
 local TOOL_TYPE_PEN = Device.input.TOOL_TYPE_PEN
@@ -11,6 +12,7 @@ local PenInput = {}
 
 PenInput.current = nil
 local gesture_hook_added = false
+local event_hook_added = false
 
 function PenInput:new(plugin)
     local o = {
@@ -66,8 +68,39 @@ function PenInput:installGestureHook()
     end)
 end
 
+function PenInput:installEventHook()
+    local Input = Device.input
+    if event_hook_added or not Input or not Input.registerEventAdjustHook then return end
+    event_hook_added = true
+    local C = ffi.C
+    local current_slot = -1
+    local pen_slot_down = false
+    Input:registerEventAdjustHook(function(input, ev)
+        if ev.type ~= C.EV_ABS then return end
+        if ev.code == C.ABS_MT_SLOT then
+            current_slot = ev.value
+            return
+        end
+        if input.pen_slot and current_slot == input.pen_slot
+            and ev.code == C.ABS_MT_TRACKING_ID then
+            pen_slot_down = ev.value >= 0
+            return
+        end
+        if ev.code == C.ABS_MT_TRACKING_ID and ev.value >= 0
+            and input.pen_slot and current_slot ~= input.pen_slot then
+            if pen_slot_down then
+                -- Drop the touchscreen mirror of the pen before it reaches the
+                -- GestureDetector (it would otherwise mirror every gesture).
+                logger.dbg("PenInput: dropped mirror contact in slot", current_slot)
+                ev.value = -1
+            end
+        end
+    end)
+end
+
 function PenInput:register()
     self:installGestureHook()
+    self:installEventHook()
     PenInput.current = self
     self:registerPlatformInput()
 end
@@ -135,6 +168,16 @@ function PenInput:onStylusEvent(input, slot)
         return false
     end
 
+    if plugin:isOverlayActive() then
+        if self.pen_active then
+            if not (slot.id and slot.id >= 0) then
+                self.pen_active = false
+            end
+            return true
+        end
+        return false
+    end
+
     if slot.tool == TOOL_TYPE_ERASER then
         return self:onEraserEvent(x, y, slot.id or -1)
     end
@@ -144,14 +187,13 @@ function PenInput:onStylusEvent(input, slot)
     end
 
     if slot.id and slot.id >= 0 then
-        if not self.pen_active and plugin:isOverlayActive() then return false end
         if not plugin:isEnabled() then return false end
         self.pen_lift_pending = false
         self.pen_active = true
 
         if plugin.current_stroke then
             plugin:addStrokePoint(x, y)
-        elseif not plugin:isOverlayActive() then
+        else
             self.pen_lift_x = x
             self.pen_lift_y = y
             plugin:startStroke(x, y)
@@ -167,7 +209,7 @@ function PenInput:onStylusEvent(input, slot)
             end
         end
 
-        if not plugin:isOverlayActive() and plugin:isEnabled() and was_active then
+        if plugin:isEnabled() and was_active then
             ret = true
         end
     end
