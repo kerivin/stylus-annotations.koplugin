@@ -208,14 +208,8 @@ end
 
 function StylusAnnotations:loadSettings()
     local ds = self.ui.doc_settings
-    local saved = ds:readSetting("stylus_annotations_live_ink")
-    local enabled
-    if saved ~= nil then
-        enabled = saved
-    else
-        enabled = not Device:hasEinkScreen() or Device:isEmulator()
-    end
-    self:updateLiveMode(enabled)
+    local live_ink_enabled = ds:readSetting("stylus_annotations_live_ink") ~= false
+    self:updateLiveMode(live_ink_enabled)
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
     self.color = ds:readSetting("stylus_annotations_color") or DEFAULT_COLOR
 end
@@ -330,7 +324,6 @@ function StylusAnnotations:startStroke(x, y)
         snapshot_ms = 0,
         paint_ms = 0,
         flush_count = 0,
-        flush_ms = 0,
         finalize_ms = 0,
     }
 
