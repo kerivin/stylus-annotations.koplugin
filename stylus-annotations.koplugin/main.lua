@@ -54,7 +54,6 @@ local SAVE_DELAY_MS = 800
 local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_INTERVAL_MS = 33
 local FAST_LIVE_REFRESH_INTERVAL_MS = 80
-local MAX_LIVE_REFRESH_INTERVAL_MS = 150
 local LIVE_MOVE_THRESHOLD_PX = 2
 local LIVE_MOVE_THRESHOLD_PX2 = LIVE_MOVE_THRESHOLD_PX * LIVE_MOVE_THRESHOLD_PX
 local LIVE_MODE_DEFERRED = "deferred"
@@ -479,7 +478,7 @@ function StylusAnnotations:finalizeLiveStroke(stroke, region)
     if not rx then return end
     Screen.bb:blitFrom(self.live_snapshot, rx, ry, rx, ry, rw, rh)
     self:renderStrokeToScreen(stroke)
-    Screen:refreshUI(rx, ry, rw, rh)
+    UIManager:setDirty(nil, "ui", Geom:new{x = rx, y = ry, w = rw, h = rh})
     if self.stroke_timing then
         self.stroke_timing.finalize_ms = time.to_ms(time.now() - t0)
     end
@@ -495,19 +494,14 @@ function StylusAnnotations:logStrokeTiming(stroke)
         "snapshot_ms=", t.snapshot_ms,
         "paint_ms=", t.paint_ms,
         "flush_count=", t.flush_count,
-        "flush_ms=", t.flush_ms,
         "finalize_ms=", t.finalize_ms)
 end
 
 function StylusAnnotations:liveRefreshInterval()
-    local interval = LIVE_REFRESH_INTERVAL_MS
     if self.live_mode == LIVE_MODE_FAST then
-        interval = FAST_LIVE_REFRESH_INTERVAL_MS
+        return FAST_LIVE_REFRESH_INTERVAL_MS
     end
-    if self.live_flush_ms then
-        interval = math.max(interval, math.ceil(self.live_flush_ms * 1.5))
-    end
-    return math.min(interval, MAX_LIVE_REFRESH_INTERVAL_MS)
+    return LIVE_REFRESH_INTERVAL_MS
 end
 
 function StylusAnnotations:flushLiveThrottled()
@@ -528,20 +522,12 @@ end
 function StylusAnnotations:flushLive(ld, stroke)
     if not self.live_snapshot then return end
     if self.live_mode == LIVE_MODE_FAST then
-        local t0 = time.now()
         local dx, dy, dw, dh = clampToScreen(ld.x, ld.y, ld.w, ld.h)
         if dx then
-            Screen:refreshFast(dx, dy, dw, dh)
+            UIManager:setDirty(nil, "fast", Geom:new{x = dx, y = dy, w = dw, h = dh})
         end
-        local ms = time.to_ms(time.now() - t0)
         if self.stroke_timing then
-            self.stroke_timing.flush_ms = self.stroke_timing.flush_ms + ms
             self.stroke_timing.flush_count = self.stroke_timing.flush_count + 1
-        end
-        if self.live_flush_ms then
-            self.live_flush_ms = self.live_flush_ms * 0.7 + ms * 0.3
-        else
-            self.live_flush_ms = ms
         end
         return
     end
@@ -555,7 +541,7 @@ function StylusAnnotations:flushLive(ld, stroke)
     end
     local dx, dy, dw, dh = clampToScreen(ld.x, ld.y, ld.w, ld.h)
     if dx then
-        Screen:refreshUI(dx, dy, dw, dh)
+        UIManager:setDirty(nil, "ui", Geom:new{x = dx, y = dy, w = dw, h = dh})
     end
 end
 
