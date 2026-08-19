@@ -53,6 +53,9 @@ end
 local SAVE_DELAY_MS = 800
 local HOLD_MOVE_THRESHOLD_PX = 15
 local LIVE_REFRESH_INTERVAL_MS = 33
+local FAST_LIVE_REFRESH_INTERVAL_MS = 80
+local MAX_LIVE_REFRESH_INTERVAL_MS = 150
+local LIVE_MOVE_THRESHOLD_PX = 2
 local DEFAULT_HOLD_INTERVAL_MS = 500
 
 local MIN_STROKE_WIDTH = 1
@@ -156,7 +159,9 @@ function StylusAnnotations:init()
     self.pen_input:register()
     self:setupTouchZones()
 
-    logger.info("StylusAnnotations: initialized, strokes =", #self.store.strokes)
+    logger.info("StylusAnnotations: initialized, strokes =", #self.store.strokes,
+        "eink =", Device:hasEinkScreen(), "fast_ink =", self.fast_ink,
+        "live_ink =", self.live_ink)
 end
 
 function StylusAnnotations:onReaderReady()
@@ -298,25 +303,33 @@ function StylusAnnotations:startStroke(x, y)
     end
     self.current_stroke = stroke
     self.pen_x, self.pen_y = x, y
+    self.last_flush_x, self.last_flush_y = x, y
     self.dirty_region = nil
     self.live_dirty = nil
-    self.last_refresh_time = time.now()
+    self.last_refresh_time = 0
+    self.stroke_timing = {
+        start = time.now(),
+        snapshot_ms = 0,
+        paint_ms = 0,
+        flush_count = 0,
+        flush_ms = 0,
+        finalize_ms = 0,
+    }
 
     if self.live_ink ~= false then
+        local t0 = time.now()
         if self.live_snapshot then
             self.live_snapshot:free()
             self.live_snapshot = nil
         end
         self.live_snapshot = Screen.bb:copy()
+        self.stroke_timing.snapshot_ms = time.to_ms(time.now() - t0)
         if self.fast_ink then
+            -- Stamp the pen-down dot into the framebuffer, but don't post a
+            -- refresh yet: the first movement flush (or the pen-up finalize)
+            -- will push it to the screen, saving a full-screen post per stroke.
             local sw = self:getStrokeScreenWidth(stroke)
-            local pad = math.floor(sw / 2) + 1
             Draw.stampDisc(Screen.bb, x, y, sw / 2, Blitbuffer.COLOR_BLACK)
-            local rx, ry, rw, rh = Geometry.clampRect(
-                x - pad, y - pad, 2 * pad, 2 * pad, Screen:getWidth(), Screen:getHeight())
-            if rx then
-                Screen:refreshFast(rx, ry, rw, rh)
-            end
         end
     end
 
@@ -336,10 +349,15 @@ function StylusAnnotations:addStrokePoint(x, y)
     local seg_w = math.abs(x - self.pen_x) + 2 * pad
     local seg_h = math.abs(y - self.pen_y) + 2 * pad
     if self.live_ink ~= false and self.fast_ink then
+        local t0 = time.now()
         Draw.stampPath(Screen.bb, {
             { x = self.pen_x, y = self.pen_y },
             { x = x, y = y },
         }, 0, 0, sw / 2, Blitbuffer.COLOR_BLACK)
+        if self.stroke_timing then
+            self.stroke_timing.paint_ms = self.stroke_timing.paint_ms
+                + time.to_ms(time.now() - t0)
+        end
     end
     self:accumulateSegment(seg_x, seg_y, seg_w, seg_h)
 
@@ -389,6 +407,7 @@ end
 function StylusAnnotations:onStrokeCancel()
     self.current_stroke = nil
     self.dirty_region = nil
+    self.stroke_timing = nil
     self:cancelLive()
     UIManager:setDirty(self.view, "partial")
 end
@@ -399,7 +418,10 @@ function StylusAnnotations:endStroke()
     local region = self.dirty_region
     self.current_stroke = nil
     self.dirty_region = nil
-    if not stroke or #stroke.points == 0 then return end
+    if not stroke or #stroke.points == 0 then
+        self.stroke_timing = nil
+        return
+    end
 
     stroke.points = self.store:decimatePoints(stroke)
 
@@ -419,10 +441,12 @@ function StylusAnnotations:endStroke()
         end
     end
     self:cancelLive()
+    self:logStrokeTiming(stroke)
 end
 
 function StylusAnnotations:finalizeLiveStroke(stroke, region)
     if not self.live_snapshot then return end
+    local t0 = time.now()
     region = region or self.store:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
     if not region then return end
     local rx, ry, rw, rh = Geometry.clampRect(
@@ -431,6 +455,36 @@ function StylusAnnotations:finalizeLiveStroke(stroke, region)
     Screen.bb:blitFrom(self.live_snapshot, rx, ry, rx, ry, rw, rh)
     self:renderStrokeToScreen(stroke)
     Screen:refreshUI(rx, ry, rw, rh)
+    if self.stroke_timing then
+        self.stroke_timing.finalize_ms = time.to_ms(time.now() - t0)
+    end
+end
+
+function StylusAnnotations:logStrokeTiming(stroke)
+    local t = self.stroke_timing
+    self.stroke_timing = nil
+    if not t then return end
+    local total_ms = time.to_ms(time.now() - t.start)
+    logger.info("StylusAnnotations: stroke points=", #stroke.points,
+        "total_ms=", total_ms,
+        "snapshot_ms=", t.snapshot_ms,
+        "paint_ms=", t.paint_ms,
+        "flush_count=", t.flush_count,
+        "flush_ms=", t.flush_ms,
+        "finalize_ms=", t.finalize_ms)
+end
+
+function StylusAnnotations:liveRefreshInterval()
+    local interval = LIVE_REFRESH_INTERVAL_MS
+    if self.fast_ink then
+        interval = FAST_LIVE_REFRESH_INTERVAL_MS
+    end
+    -- Back off when refreshes themselves take a long time, so we never queue
+    -- more display updates than the EPD controller can drain.
+    if self.live_flush_ms then
+        interval = math.max(interval, math.ceil(self.live_flush_ms * 1.5))
+    end
+    return math.min(interval, MAX_LIVE_REFRESH_INTERVAL_MS)
 end
 
 function StylusAnnotations:flushLiveThrottled()
@@ -438,8 +492,14 @@ function StylusAnnotations:flushLiveThrottled()
     local ld = self.live_dirty
     if not ld or ld.w <= 0 or ld.h <= 0 then return end
     local now = time.now()
-    if time.to_ms(now - self.last_refresh_time) < LIVE_REFRESH_INTERVAL_MS then return end
+    if time.to_ms(now - self.last_refresh_time) < self:liveRefreshInterval() then return end
+    -- Skip refreshes when the pen is (nearly) stationary: a jittery/hovering
+    -- pen would otherwise flood the display with full-screen posts.
+    local dx = self.pen_x - self.last_flush_x
+    local dy = self.pen_y - self.last_flush_y
+    if dx * dx + dy * dy < LIVE_MOVE_THRESHOLD_PX * LIVE_MOVE_THRESHOLD_PX then return end
     self.last_refresh_time = now
+    self.last_flush_x, self.last_flush_y = self.pen_x, self.pen_y
     self.live_dirty = nil
     self:flushLive(ld, self.current_stroke)
 end
@@ -450,10 +510,21 @@ function StylusAnnotations:flushLive(ld, stroke)
         -- Additive live ink: the new segment is already stamped black on the
         -- framebuffer; a fast (DU) regional refresh just pushes the changed
         -- pixels to the screen, leaving the rest of the region untouched.
+        local t0 = time.now()
         local dx, dy, dw, dh = Geometry.clampRect(
             ld.x, ld.y, ld.w, ld.h, Screen:getWidth(), Screen:getHeight())
         if dx then
             Screen:refreshFast(dx, dy, dw, dh)
+        end
+        local ms = time.to_ms(time.now() - t0)
+        if self.stroke_timing then
+            self.stroke_timing.flush_ms = self.stroke_timing.flush_ms + ms
+            self.stroke_timing.flush_count = self.stroke_timing.flush_count + 1
+        end
+        if self.live_flush_ms then
+            self.live_flush_ms = self.live_flush_ms * 0.7 + ms * 0.3
+        else
+            self.live_flush_ms = ms
         end
         return
     end
@@ -984,4 +1055,3 @@ function StylusAnnotations:loadStrokes()
 end
 
 return StylusAnnotations
-
