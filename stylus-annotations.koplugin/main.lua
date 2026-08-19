@@ -124,6 +124,7 @@ local StylusAnnotations = InputContainer:extend{
     selection_backup_y = 0,
     dirty_region = nil,
     live_ink = true,
+    fast_ink = false,
     live_snapshot = nil,
     live_dirty = nil,
     last_refresh_time = 0,
@@ -191,6 +192,7 @@ function StylusAnnotations:loadSettings()
     else
         self.live_ink = not Device:hasEinkScreen() or Device:isEmulator()
     end
+    self.fast_ink = Device:hasEinkScreen()
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
     self.color = ds:readSetting("stylus_annotations_color") or DEFAULT_COLOR
 end
@@ -306,6 +308,16 @@ function StylusAnnotations:startStroke(x, y)
             self.live_snapshot = nil
         end
         self.live_snapshot = Screen.bb:copy()
+        if self.fast_ink then
+            local sw = self:getStrokeScreenWidth(stroke)
+            local pad = math.floor(sw / 2) + 1
+            Draw.stampDisc(Screen.bb, x, y, sw / 2, Blitbuffer.COLOR_BLACK)
+            local rx, ry, rw, rh = Geometry.clampRect(
+                x - pad, y - pad, 2 * pad, 2 * pad, Screen:getWidth(), Screen:getHeight())
+            if rx then
+                Screen:refreshFast(rx, ry, rw, rh)
+            end
+        end
     end
 
     self.hold_start_x, self.hold_start_y = x, y
@@ -323,6 +335,12 @@ function StylusAnnotations:addStrokePoint(x, y)
     local seg_y = math.min(self.pen_y, y) - pad
     local seg_w = math.abs(x - self.pen_x) + 2 * pad
     local seg_h = math.abs(y - self.pen_y) + 2 * pad
+    if self.live_ink ~= false and self.fast_ink then
+        Draw.stampPath(Screen.bb, {
+            { x = self.pen_x, y = self.pen_y },
+            { x = x, y = y },
+        }, 0, 0, sw / 2, Blitbuffer.COLOR_BLACK)
+    end
     self:accumulateSegment(seg_x, seg_y, seg_w, seg_h)
 
     self.pen_x, self.pen_y = x, y
@@ -392,6 +410,8 @@ function StylusAnnotations:endStroke()
     if self.live_ink == false then
         self:renderStrokeToScreen(stroke)
         self:refreshRegion(region)
+    elseif self.fast_ink then
+        self:finalizeLiveStroke(stroke, region or self.live_dirty)
     else
         local ld = self.live_dirty
         if ld and (ld.w > 0 or ld.h > 0) then
@@ -399,6 +419,18 @@ function StylusAnnotations:endStroke()
         end
     end
     self:cancelLive()
+end
+
+function StylusAnnotations:finalizeLiveStroke(stroke, region)
+    if not self.live_snapshot then return end
+    region = region or self.store:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
+    if not region then return end
+    local rx, ry, rw, rh = Geometry.clampRect(
+        region.x, region.y, region.w, region.h, Screen:getWidth(), Screen:getHeight())
+    if not rx then return end
+    Screen.bb:blitFrom(self.live_snapshot, rx, ry, rx, ry, rw, rh)
+    self:renderStrokeToScreen(stroke)
+    Screen:refreshUI(rx, ry, rw, rh)
 end
 
 function StylusAnnotations:flushLiveThrottled()
@@ -414,6 +446,17 @@ end
 
 function StylusAnnotations:flushLive(ld, stroke)
     if not self.live_snapshot then return end
+    if self.fast_ink then
+        -- Additive live ink: the new segment is already stamped black on the
+        -- framebuffer; a fast (DU) regional refresh just pushes the changed
+        -- pixels to the screen, leaving the rest of the region untouched.
+        local dx, dy, dw, dh = Geometry.clampRect(
+            ld.x, ld.y, ld.w, ld.h, Screen:getWidth(), Screen:getHeight())
+        if dx then
+            Screen:refreshFast(dx, dy, dw, dh)
+        end
+        return
+    end
     local bb = Screen.bb
     -- Restore the pre-stroke snapshot over the whole accumulated dirty region,
     -- then re-render the full stroke; only the delta region needs a screen refresh.
