@@ -94,13 +94,6 @@ if [ ! -d "$PLUGIN_DIR" ]; then
 fi
 FILES=$(cd "$PLUGIN_DIR" && find . -type f | sed 's|^\./||')
 
-push_plugin() {
-    DEST=$1
-    echo "-> $DEST"
-    "$ADB" $ADB_ARGS shell "run-as $PKG sh -c 'rm -rf $DEST && mkdir -p $DEST'"
-    tar -cf - -C "$PLUGIN_DIR" $FILES 2>/dev/null | "$ADB" $ADB_ARGS shell "run-as $PKG sh -c 'cd $DEST && tar -xf -'" >/dev/null 2>&1 || true
-}
-
 verify_plugin() {
     DEST=$1
     FAIL=0
@@ -121,7 +114,10 @@ ensure_extra_plugin_paths() {
     echo "Ensuring extra_plugin_paths includes $EXTRA_DIR in $SETTINGS"
     "$ADB" $ADB_ARGS shell "run-as $PKG sh -c '
         f=$SETTINGS
-        if [ ! -f \"\$f\" ]; then return; fi
+        if [ ! -f \"\$f\" ]; then
+            printf \"return {\\n    [\\\"extra_plugin_paths\\\"] = {\\n        [1] = \\\"$EXTRA_DIR/\\\",\\n    },\\n}\\n\" > \"\$f\"
+            return
+        fi
         if ! grep -q \"$EXTRA_DIR\" \"\$f\"; then
             sed -i \"s|^}|    [\\\"extra_plugin_paths\\\"] = {\\n        [1] = \\\"$EXTRA_DIR/\\\",\\n    },\\n}|g\" \"\$f\"
         fi
@@ -132,15 +128,18 @@ echo "Using adb: $ADB $ADB_ARGS"
 echo "Stopping $PKG"
 "$ADB" $ADB_ARGS shell "am force-stop $PKG"
 
-push_plugin "$ASSET_DEST"
-push_plugin "$EXTRA_DEST"
+echo "-> $EXTRA_DEST"
+"$ADB" $ADB_ARGS shell "run-as $PKG sh -c 'rm -rf $EXTRA_DEST && mkdir -p $EXTRA_DEST'"
+tar -cf - -C "$PLUGIN_DIR" $FILES 2>/dev/null | "$ADB" $ADB_ARGS shell "run-as $PKG sh -c 'cd $EXTRA_DEST && tar -xf -'" >/dev/null 2>&1 || true
 
 echo "Verifying checksums"
-if ! verify_plugin "$ASSET_DEST"; then
-    if ! verify_plugin "$EXTRA_DEST"; then
-        echo "Checksum verification failed for both destinations" >&2
-        exit 1
-    fi
+if ! verify_plugin "$EXTRA_DEST"; then
+    echo "Checksum verification failed" >&2
+    exit 1
+fi
+
+if [ "$ASSET_PLUGINS/stylus-annotations.koplugin" != "$EXTRA_DEST" ]; then
+    "$ADB" $ADB_ARGS shell "run-as $PKG sh -c 'rm -rf $ASSET_DEST'" 2>/dev/null || true
 fi
 
 ensure_extra_plugin_paths
