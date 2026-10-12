@@ -59,6 +59,71 @@ function Geometry.strokeDistanceSq(px, py, stroke)
     return min_sq
 end
 
+local function pointOnSegment(px, py, ax, ay, bx, by)
+    local cross = (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+    if math.abs(cross) > 0.001 then return false end
+    return px >= math.min(ax, bx) - 0.001 and px <= math.max(ax, bx) + 0.001
+        and py >= math.min(ay, by) - 0.001 and py <= math.max(ay, by) + 0.001
+end
+
+local function pointInPolygon(px, py, polygon)
+    local inside = false
+    local j = #polygon
+    for i = 1, #polygon do
+        local a, b = polygon[i], polygon[j]
+        if pointOnSegment(px, py, a.x, a.y, b.x, b.y) then return true end
+        if (a.y > py) ~= (b.y > py)
+            and px < (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x then
+            inside = not inside
+        end
+        j = i
+    end
+    return inside
+end
+
+local function orientation(ax, ay, bx, by, cx, cy)
+    local cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    if math.abs(cross) <= 0.001 then return 0 end
+    return cross > 0 and 1 or -1
+end
+
+local function segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy)
+    local o1 = orientation(ax, ay, bx, by, cx, cy)
+    local o2 = orientation(ax, ay, bx, by, dx, dy)
+    local o3 = orientation(cx, cy, dx, dy, ax, ay)
+    local o4 = orientation(cx, cy, dx, dy, bx, by)
+    if o1 * o2 < 0 and o3 * o4 < 0 then return true end
+    return (o1 == 0 and pointOnSegment(cx, cy, ax, ay, bx, by))
+        or (o2 == 0 and pointOnSegment(dx, dy, ax, ay, bx, by))
+        or (o3 == 0 and pointOnSegment(ax, ay, cx, cy, dx, dy))
+        or (o4 == 0 and pointOnSegment(bx, by, cx, cy, dx, dy))
+end
+
+function Geometry.polylineIntersectsPolygon(points, polygon)
+    if not points or #points < 2 or not polygon or #polygon < 3 then return false end
+    local sx0, sy0, sx1, sy1 = Geometry.screenBounds(points)
+    local lx0, ly0, lx1, ly1 = Geometry.pointsBounds(polygon)
+    if not sx0 or not lx0 or not Geometry.boundsOverlap(sx0, sy0, sx1, sy1, lx0, ly0, lx1, ly1, 1) then
+        return false
+    end
+
+    local count = math.floor(#points / 2)
+    for i = 1, count do
+        if pointInPolygon(points[2 * i - 1], points[2 * i], polygon) then return true end
+    end
+
+    local edge_count = #polygon
+    for i = 1, count - 1 do
+        local ax, ay = points[2 * i - 1], points[2 * i]
+        local bx, by = points[2 * i + 1], points[2 * i + 2]
+        for j = 1, edge_count do
+            local a, b = polygon[j], polygon[j % edge_count + 1]
+            if segmentsIntersect(ax, ay, bx, by, a.x, a.y, b.x, b.y) then return true end
+        end
+    end
+    return false
+end
+
 function Geometry.screenBounds(spts)
     local n = math.floor(#spts / 2)
     if n == 0 then return end

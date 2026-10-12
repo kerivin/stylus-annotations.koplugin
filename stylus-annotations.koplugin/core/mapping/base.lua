@@ -22,6 +22,10 @@ function Mapping:getStrokeScreenWidth(stroke)
     return math.max(1, math.floor(stroke.width * (stroke.zoom or 1) + 0.5))
 end
 
+function Mapping:moveStrokeByScreen(stroke, dx, dy)
+    return false
+end
+
 function Mapping:packPoints(points)
     local coords = {}
     for i = 1, #points do

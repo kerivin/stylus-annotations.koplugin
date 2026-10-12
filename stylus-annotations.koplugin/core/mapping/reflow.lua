@@ -67,6 +67,19 @@ function Reflow:anchorScale(stroke, b)
     return sx, sy
 end
 
+function Reflow:moveStrokeByScreen(stroke, dx, dy)
+    local boxes = self:getDoc():getScreenBoxesFromPositions(stroke.anchor.pos0, stroke.anchor.pos1, true)
+    if not boxes or #boxes == 0 then return false end
+    local sx, sy = self:anchorScale(stroke, boxes[1])
+    if sx == 0 or sy == 0 then return false end
+    local points = stroke.points
+    for i = 1, #points, 2 do
+        points[i] = points[i] + dx / sx
+        points[i + 1] = points[i + 1] + dy / sy
+    end
+    return true
+end
+
 function Reflow:strokeToScreenPts(stroke)
     local doc = self:getDoc()
     local boxes = doc:getScreenBoxesFromPositions(stroke.anchor.pos0, stroke.anchor.pos1, true)

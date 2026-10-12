@@ -66,6 +66,15 @@ local MAX_STROKE_WIDTH = 30
 local DEFAULT_WIDTH = 2
 local DEFAULT_COLOR = "orange"
 local WIDTH_CHOICES = { 1, 2, 3, 5, 8, 12 }
+local TOOL_PEN = "pen"
+local TOOL_ERASER = "eraser"
+local TOOL_LASSO = "lasso"
+local LASSO_POINT_SPACING_PX = 2
+local LASSO_REFRESH_INTERVAL_MS = 80
+local TOOLBAR_MOVE_DELAY_S = 0.5
+local MAX_UNDO_ACTIONS = 30
+local ERASER_RADIUS_PX = 20
+local SELECTION_MOVE_REFRESH_INTERVAL_MS = 50
 
 local FULL_SCREEN_ZONE = {
     ratio_x = 0, ratio_y = 0,
@@ -112,6 +121,20 @@ local WidthPreview = Widget:extend{
     end,
 }
 
+local EraserCursor = Widget:extend{
+    name = "stylus_annotations_eraser_cursor",
+    modal = false,
+    cursor = nil,
+    paintTo = function(self, bb, x, y)
+        local cursor = self.cursor
+        if not cursor then return end
+        Draw.paintCircleOutline(bb, x + cursor.x, y + cursor.y, cursor.radius + 1,
+            Blitbuffer.COLOR_WHITE, 4)
+        Draw.paintCircleOutline(bb, x + cursor.x, y + cursor.y, cursor.radius,
+            Blitbuffer.COLOR_BLACK, 2)
+    end,
+}
+
 local StylusAnnotations = InputContainer:extend{
     name = "stylus_annotations",
     is_doc_only = true,
@@ -138,6 +161,23 @@ local StylusAnnotations = InputContainer:extend{
     live_dirty = nil,
     last_refresh_time = 0,
     pending_save = nil,
+    tool_mode = TOOL_PEN,
+    tool_palette = nil,
+    toolbar_offset = nil,
+    lasso_points = nil,
+    lasso_last_refresh_time = 0,
+    context_strokes = nil,
+    toolbar_move_timer = nil,
+    pending_toolbar_move = nil,
+    undo_stack = {},
+    redo_stack = {},
+    selection_move = nil,
+    pending_selection_touch = nil,
+    eraser_cursor = nil,
+    eraser_rendered_cursor = nil,
+    eraser_cursor_widget = nil,
+    eraser_last_refresh_time = 0,
+    erase_transaction = nil,
 }
 
 function StylusAnnotations:init()
@@ -171,6 +211,7 @@ end
 
 function StylusAnnotations:onReaderReady()
     self:loadStrokes()
+    self:resetUndoHistory()
     self.ui:handleEvent(Event:new("UpdatePos"))
 end
 
@@ -181,8 +222,16 @@ function StylusAnnotations:onCloseDocument()
     end
     self:cancelHoldTimer()
     self.current_stroke = nil
+    self:cancelLasso()
+    self.selection_move = nil
+    self.pending_selection_touch = nil
+    self:endEraser()
     self:cancelLive()
+    self:closeToolPalette()
     self.pen_input:unregister()
+    self.pen_input.pen_active = false
+    self.pen_input.active_mode = nil
+    self.pen_input.eraser_active = false
     self:saveStrokes()
 end
 
@@ -212,6 +261,17 @@ function StylusAnnotations:loadSettings()
     self:updateLiveMode(live_ink_enabled)
     self.width = ds:readSetting("stylus_annotations_width") or DEFAULT_WIDTH
     self.color = ds:readSetting("stylus_annotations_color") or DEFAULT_COLOR
+    local tool_mode = ds:readSetting("stylus_annotations_tool_mode")
+    if tool_mode == TOOL_ERASER or tool_mode == TOOL_LASSO then
+        self.tool_mode = tool_mode
+    else
+        self.tool_mode = TOOL_PEN
+    end
+    if ds:readSetting("stylus_annotations_toolbar_offset_version") == 1 then
+        self.toolbar_offset = ds:readSetting("stylus_annotations_toolbar_offset")
+    else
+        self.toolbar_offset = nil
+    end
 end
 
 function StylusAnnotations:saveSettings()
@@ -219,16 +279,479 @@ function StylusAnnotations:saveSettings()
     ds:saveSetting("stylus_annotations_live_ink", self:liveInkEnabled())
     ds:saveSetting("stylus_annotations_width", self.width)
     ds:saveSetting("stylus_annotations_color", self.color)
+    ds:saveSetting("stylus_annotations_tool_mode", self.tool_mode)
+    ds:saveSetting("stylus_annotations_toolbar_offset", self.toolbar_offset)
+    if self.toolbar_offset then
+        ds:saveSetting("stylus_annotations_toolbar_offset_version", 1)
+    end
+end
+
+function StylusAnnotations:resetUndoHistory()
+    self.undo_stack = {}
+    self.redo_stack = {}
+    self:updateUndoRedoButtons()
+end
+
+function StylusAnnotations:recordHistory(undo, redo)
+    self.undo_stack[#self.undo_stack + 1] = { undo = undo, redo = redo }
+    if #self.undo_stack > MAX_UNDO_ACTIONS then
+        table.remove(self.undo_stack, 1)
+    end
+    self.redo_stack = {}
+    self:updateUndoRedoButtons()
+end
+
+function StylusAnnotations:updateUndoRedoButtons()
+    local dialog = self.tool_palette
+    if not dialog then return end
+    local undo = dialog:getButtonById("stylus_undo")
+    local redo = dialog:getButtonById("stylus_redo")
+    if not undo or not redo then return end
+    undo:setText(T(_("Undo (%1)"), #self.undo_stack), undo.width)
+    redo:setText(T(_("Redo (%1)"), #self.redo_stack), redo.width)
+    if #self.undo_stack > 0 then undo:enable() else undo:disable() end
+    if #self.redo_stack > 0 then redo:enable() else redo:disable() end
+    local dimen = dialog.movable and dialog.movable.dimen or dialog.dimen
+    if dimen then
+        UIManager:setDirty(dialog, "ui", dimen)
+    else
+        UIManager:setDirty(dialog, "ui")
+    end
+end
+
+function StylusAnnotations:finishHistoryChange(had_selection)
+    self:scheduleSave()
+    UIManager:setDirty(self.ui, "partial")
+    if had_selection then
+        self:refreshToolPalette()
+    end
+end
+
+function StylusAnnotations:undoLastAction()
+    local action = table.remove(self.undo_stack)
+    if not action then
+        UIManager:show(InfoMessage:new{ text = _("Nothing to undo."), timeout = 1 })
+        return false
+    end
+    local had_selection = self.context_strokes ~= nil
+    self:clearSelection()
+    self.context_strokes = nil
+    action.undo()
+    self.redo_stack[#self.redo_stack + 1] = action
+    self:updateUndoRedoButtons()
+    self:finishHistoryChange(had_selection)
+    return true
+end
+
+function StylusAnnotations:redoLastAction()
+    local action = table.remove(self.redo_stack)
+    if not action then
+        UIManager:show(InfoMessage:new{ text = _("Nothing to redo."), timeout = 1 })
+        return false
+    end
+    local had_selection = self.context_strokes ~= nil
+    self:clearSelection()
+    self.context_strokes = nil
+    action.redo()
+    self.undo_stack[#self.undo_stack + 1] = action
+    self:updateUndoRedoButtons()
+    self:finishHistoryChange(had_selection)
+    return true
+end
+
+function StylusAnnotations:captureStrokeEntries(strokes)
+    local wanted = {}
+    for _, stroke in ipairs(strokes) do wanted[stroke] = true end
+    local entries = {}
+    for index, stroke in ipairs(self.store.strokes) do
+        if wanted[stroke] then
+            entries[#entries + 1] = { index = index, stroke = stroke }
+        end
+    end
+    return entries
+end
+
+function StylusAnnotations:restoreStrokeEntries(entries)
+    for _, entry in ipairs(entries) do
+        table.insert(self.store.strokes, math.min(entry.index, #self.store.strokes + 1), entry.stroke)
+    end
+    self.store:rebuildPageIndex()
+end
+
+function StylusAnnotations:removeStrokesWithUndo(strokes)
+    local entries = self:captureStrokeEntries(strokes)
+    local removed = self.store:remove(strokes)
+    if removed > 0 then
+        self:recordHistory(function()
+            self:restoreStrokeEntries(entries)
+        end, function()
+            self.store:remove(strokes)
+        end)
+    end
+    return removed
 end
 
 function StylusAnnotations:isPenActive()
     return self.pen_input and self.pen_input:isPenActive() or false
 end
 
-function StylusAnnotations:isOverlayActive()
+function StylusAnnotations:isOverlayActive(x, y)
     local top = UIManager:getTopmostVisibleWidget()
     if not top then return false end
-    return (top.name or top.id) ~= "ReaderUI"
+    local name = top.name or top.id
+    local dimen = self.tool_palette and self.tool_palette.movable and self.tool_palette.movable.dimen
+    if x and y and dimen
+            and x >= dimen.x and x < dimen.x + dimen.w
+            and y >= dimen.y and y < dimen.y + dimen.h then
+        return true
+    end
+    if name == "stylus_annotations_toolbar"
+        or name == "stylus_annotations_eraser_cursor" then
+        return false
+    end
+    return name ~= "ReaderUI"
+end
+
+function StylusAnnotations:showToolPalette()
+    if self.tool_palette then return end
+
+    local width = math.max(1, Screen:getWidth() - 2 * Screen:scaleBySize(8))
+    local anchor_y = Screen:scaleBySize(12)
+    local mode_text = function(mode, label)
+        return mode == self.tool_mode and label .. " ✓" or label
+    end
+    local buttons = {
+        {
+            {
+                text = mode_text(TOOL_PEN, _("Pen")),
+                callback = function() self:setToolMode(TOOL_PEN) end,
+            },
+            {
+                text = mode_text(TOOL_ERASER, _("Eraser")),
+                callback = function() self:setToolMode(TOOL_ERASER) end,
+            },
+            {
+                text = mode_text(TOOL_LASSO, _("Lasso")),
+                callback = function() self:setToolMode(TOOL_LASSO) end,
+            },
+        },
+        {
+            {
+                id = "stylus_undo",
+                text = _("Undo"),
+                enabled = #self.undo_stack > 0,
+                callback = function() self:undoLastAction() end,
+            },
+            {
+                id = "stylus_redo",
+                text = _("Redo"),
+                enabled = #self.redo_stack > 0,
+                callback = function() self:redoLastAction() end,
+            },
+        },
+        {
+            {
+                text = _("Color"),
+                callback = function() self:onToolColor() end,
+            },
+            {
+                text = _("Width"),
+                callback = function() self:onToolWidth() end,
+            },
+            {
+                text = "×",
+                callback = function() self:closeToolPalette() end,
+            },
+        },
+    }
+    if self.context_strokes then
+        buttons[#buttons + 1] = {
+            {
+                text = T(_("Delete selected (%1)"), #self.context_strokes),
+                callback = function() self:deleteToolSelection() end,
+            },
+        }
+    end
+    local dialog
+    dialog = ButtonDialog:new{
+        id = "stylus_annotations_toolbar",
+        name = "stylus_annotations_toolbar",
+        modal = false,
+        title = self.context_strokes
+            and T(_("Selected strokes: %1"), #self.context_strokes)
+            or _("Stylus tools"),
+        width = width,
+        dismissable = false,
+        anchor = function()
+            return Geom:new{
+                x = Screen:scaleBySize(8),
+                y = anchor_y,
+                w = width,
+                h = 0,
+            }
+        end,
+        buttons = buttons,
+    }
+
+    local offset = self.toolbar_offset
+    if offset and offset.x and offset.y then
+        dialog.movable:setMovedOffset(Geom:new{ x = offset.x, y = offset.y })
+        dialog.movable._anchor_ensured = true
+    end
+    local movable = dialog.movable
+    local move_by = movable._moveBy
+    movable._moveBy = function(container, dx, dy, restrict_to_screen)
+        if dx == nil or dy == nil then
+            self:flushToolbarMove()
+            return move_by(container, dx, dy, restrict_to_screen)
+        end
+        self:queueToolbarMove(container, move_by, dx, dy, restrict_to_screen)
+    end
+    local movable_touch = movable.onMovableTouch
+    movable.onMovableTouch = function(container, arg, ges)
+        local handled = movable_touch(container, arg, ges)
+        if container._touch_pre_pan_was_inside and ges and ges.pos then
+            container._toolbar_touch_start = { x = ges.pos.x, y = ges.pos.y }
+            container._toolbar_last_pointer = { x = ges.pos.x, y = ges.pos.y }
+        else
+            container._toolbar_touch_start = nil
+            container._toolbar_last_pointer = nil
+        end
+        return handled
+    end
+    local movable_hold = movable.onMovableHold
+    movable.onMovableHold = function(container, arg, ges)
+        local handled = movable_hold(container, arg, ges)
+        if handled and ges and ges.pos then
+            container._toolbar_touch_start = { x = ges.pos.x, y = ges.pos.y }
+            container._toolbar_last_pointer = { x = ges.pos.x, y = ges.pos.y }
+        end
+        return handled
+    end
+    local movable_pan = movable.onMovablePan
+    movable.onMovablePan = function(container, arg, ges)
+        if self.selection_move then return false end
+        if not container._toolbar_touch_start and not container._moving then return false end
+        local handled = movable_pan(container, arg, ges)
+        if handled then self:trackToolbarPointer(container, move_by, ges) end
+        return handled
+    end
+    local movable_hold_pan = movable.onMovableHoldPan
+    movable.onMovableHoldPan = function(container, arg, ges)
+        if self.selection_move then return false end
+        if not container._toolbar_touch_start and not container._moving then return false end
+        local handled = movable_hold_pan(container, arg, ges)
+        if handled then self:trackToolbarPointer(container, move_by, ges) end
+        return handled
+    end
+    local movable_pan_release = movable.onMovablePanRelease
+    movable.onMovablePanRelease = function(container, arg, ges)
+        if self.selection_move then return false end
+        if not container._moving then
+            container._toolbar_last_pointer = nil
+            container._toolbar_touch_start = nil
+            return movable_pan_release(container, arg, ges)
+        end
+        self:trackToolbarPointer(container, move_by, ges)
+        self:flushToolbarMove()
+        container._moving = false
+        container._touch_pre_pan_was_inside = false
+        container._move_relative_x, container._move_relative_y = nil, nil
+        container._toolbar_last_pointer = nil
+        container._toolbar_touch_start = nil
+        return true
+    end
+    local movable_hold_release = movable.onMovableHoldRelease
+    movable.onMovableHoldRelease = function(container, arg, ges)
+        if self.selection_move then return false end
+        local start = container._toolbar_touch_start
+        if container._moving and start and ges and ges.pos then
+            local dx = ges.pos.x - start.x
+            local dy = ges.pos.y - start.y
+            if math.abs(dx) >= container.move_threshold or math.abs(dy) >= container.move_threshold then
+                self:trackToolbarPointer(container, move_by, ges)
+                self:flushToolbarMove()
+                container._moving = false
+                container._touch_pre_pan_was_inside = false
+                container._move_relative_x, container._move_relative_y = nil, nil
+                container._toolbar_last_pointer = nil
+                container._toolbar_touch_start = nil
+                return true
+            end
+        end
+        local handled = movable_hold_release(container, arg, ges)
+        container._toolbar_last_pointer = nil
+        container._toolbar_touch_start = nil
+        return handled
+    end
+    self.tool_palette = dialog
+    UIManager:show(dialog, "[ui]")
+end
+
+function StylusAnnotations:queueToolbarMove(movable, move_by, dx, dy, restrict_to_screen)
+    if dx == 0 and dy == 0 then return end
+    local pending = self.pending_toolbar_move
+    if pending and pending.movable == movable then
+        pending.dx = pending.dx + dx
+        pending.dy = pending.dy + dy
+        pending.restrict_to_screen = restrict_to_screen or pending.restrict_to_screen
+    else
+        self.pending_toolbar_move = {
+            movable = movable,
+            move_by = move_by,
+            dx = dx,
+            dy = dy,
+            restrict_to_screen = restrict_to_screen,
+        }
+    end
+    if self.toolbar_move_timer then return end
+    local timer
+    timer = function()
+        if self.toolbar_move_timer ~= timer then return end
+        self.toolbar_move_timer = nil
+        self:flushToolbarMove()
+    end
+    self.toolbar_move_timer = timer
+    UIManager:scheduleIn(TOOLBAR_MOVE_DELAY_S, timer)
+end
+
+function StylusAnnotations:trackToolbarPointer(movable, move_by, ges)
+    if not ges or not ges.pos then return end
+    local previous = movable._toolbar_last_pointer
+    local x, y = ges.pos.x, ges.pos.y
+    if previous then
+        self:queueToolbarMove(movable, move_by, x - previous.x, y - previous.y)
+    else
+        movable._toolbar_touch_start = { x = x, y = y }
+    end
+    movable._toolbar_last_pointer = { x = x, y = y }
+end
+
+function StylusAnnotations:flushToolbarMove()
+    local timer = self.toolbar_move_timer
+    local pending = self.pending_toolbar_move
+    if timer then UIManager:unschedule(timer) end
+    self.toolbar_move_timer = nil
+    self.pending_toolbar_move = nil
+    if pending then
+        pending.move_by(pending.movable, pending.dx, pending.dy, pending.restrict_to_screen)
+        local moved = pending.movable:getMovedOffset()
+        self.toolbar_offset = { x = moved.x, y = moved.y }
+        if self.tool_palette and self.tool_palette.movable == pending.movable then
+            self:saveSettings()
+        end
+    end
+end
+
+function StylusAnnotations:closeToolPalette()
+    local dialog = self.tool_palette
+    if not dialog then return end
+    self:flushToolbarMove()
+    self:clearSelection()
+    self.context_strokes = nil
+    local offset = dialog.movable:getMovedOffset()
+    self.toolbar_offset = { x = offset.x, y = offset.y }
+    self.tool_palette = nil
+    self:saveSettings()
+    UIManager:close(dialog)
+end
+
+function StylusAnnotations:refreshToolPalette()
+    local dialog = self.tool_palette
+    if not dialog then
+        self:showToolPalette()
+        return
+    end
+    self:flushToolbarMove()
+    local moved = dialog.movable:getMovedOffset()
+    self.toolbar_offset = { x = moved.x, y = moved.y }
+    self.tool_palette = nil
+    UIManager:close(dialog)
+    self:showToolPalette()
+end
+
+function StylusAnnotations:setToolMode(mode)
+    if mode ~= TOOL_PEN and mode ~= TOOL_ERASER and mode ~= TOOL_LASSO then return end
+    if self.tool_mode == mode then return end
+    self.tool_mode = mode
+    self:refreshToolPalette()
+    self:saveSettings()
+end
+
+function StylusAnnotations:onToolColor()
+    local strokes = self.context_strokes
+    if not strokes then
+        self:choosePenColor()
+        return
+    end
+    self:clearSelection()
+    self.context_strokes = nil
+    self:refreshToolPalette()
+    self:chooseStrokeColor(strokes)
+end
+
+function StylusAnnotations:onToolWidth()
+    local strokes = self.context_strokes
+    if not strokes then
+        self:choosePenWidth()
+        return
+    end
+    self:clearSelection()
+    self.context_strokes = nil
+    self:refreshToolPalette()
+    self:chooseStrokeWidth(strokes)
+end
+
+function StylusAnnotations:deleteToolSelection()
+    local strokes = self.context_strokes
+    if not strokes then return end
+    self:clearSelection()
+    self.context_strokes = nil
+    self:refreshToolPalette()
+    self:deleteStrokes(strokes, #strokes > 1)
+end
+
+function StylusAnnotations:startLasso(x, y)
+    self:showToolPalette()
+    self.lasso_points = { { x = x, y = y } }
+    self.lasso_last_refresh_time = time.now()
+    UIManager:setDirty(self.ui, "partial")
+end
+
+function StylusAnnotations:addLassoPoint(x, y)
+    local points = self.lasso_points
+    if not points then
+        self:startLasso(x, y)
+        return
+    end
+    local last = points[#points]
+    local dx, dy = x - last.x, y - last.y
+    if dx * dx + dy * dy < LASSO_POINT_SPACING_PX * LASSO_POINT_SPACING_PX then return end
+    points[#points + 1] = { x = x, y = y }
+    local now = time.now()
+    if time.to_ms(now - self.lasso_last_refresh_time) >= LASSO_REFRESH_INTERVAL_MS then
+        self.lasso_last_refresh_time = now
+        UIManager:setDirty(self.ui, "partial")
+    end
+end
+
+function StylusAnnotations:finishLasso()
+    local points = self.lasso_points
+    self.lasso_points = nil
+    self.lasso_last_refresh_time = 0
+    UIManager:setDirty(self.ui, "partial")
+    if not points or #points < 3 then return end
+    local strokes = self.store:findStrokesInPolygon(points)
+    if #strokes > 0 then
+        self:showStrokeMenu(strokes)
+    end
+end
+
+function StylusAnnotations:cancelLasso()
+    if not self.lasso_points then return end
+    self.lasso_points = nil
+    self.lasso_last_refresh_time = 0
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:setupTouchZones()
@@ -269,6 +792,50 @@ function StylusAnnotations:setupTouchZones()
                 return self:onStrokeHold(ges)
             end,
         },
+        {
+            id = "stylus_annotations_touch",
+            ges = "touch",
+            screen_zone = FULL_SCREEN_ZONE,
+            handler = function(ges)
+                return self:onSelectionTouch(ges)
+            end,
+        },
+        {
+            id = "stylus_annotations_pan",
+            ges = "pan",
+            screen_zone = FULL_SCREEN_ZONE,
+            overrides = { "paging_pan", "rolling_pan" },
+            handler = function(ges)
+                return self:onSelectionPan(ges)
+            end,
+        },
+        {
+            id = "stylus_annotations_pan_release",
+            ges = "pan_release",
+            screen_zone = FULL_SCREEN_ZONE,
+            overrides = { "paging_pan_release", "rolling_pan_release" },
+            handler = function(ges)
+                return self:onSelectionPanRelease(ges)
+            end,
+        },
+        {
+            id = "stylus_annotations_hold_pan",
+            ges = "hold_pan",
+            screen_zone = FULL_SCREEN_ZONE,
+            overrides = { "readerhighlight_hold_pan" },
+            handler = function(ges)
+                return self:onSelectionPan(ges)
+            end,
+        },
+        {
+            id = "stylus_annotations_hold_release",
+            ges = "hold_release",
+            screen_zone = FULL_SCREEN_ZONE,
+            overrides = { "readerhighlight_hold_release" },
+            handler = function(ges)
+                return self:onSelectionPanRelease(ges)
+            end,
+        },
     })
     self.touch_zones_registered = true
 end
@@ -276,8 +843,25 @@ end
 function StylusAnnotations:selectStrokeAt(ges, chain)
     if self.current_stroke then return true end
     if self:isPenActive() then return true end
-    if self:isOverlayActive() then return false end
+    if not chain then self.pending_selection_touch = nil end
+    if self:isOverlayActive(
+        ges and ges.pos and ges.pos.x,
+        ges and ges.pos and ges.pos.y
+    ) then
+        return false
+    end
     local stroke = self:findStrokeAt(ges)
+    if self.context_strokes then
+        local already_selected = false
+        for _, selected in ipairs(self.context_strokes) do
+            if selected == stroke then
+                already_selected = true
+                break
+            end
+        end
+        if already_selected then return true end
+        self:deselectContextSelection()
+    end
     if not stroke then return false end
     if chain then
         self:showStrokeMenu(self.store:selectStrokesChain(stroke))
@@ -287,12 +871,137 @@ function StylusAnnotations:selectStrokeAt(ges, chain)
     return true
 end
 
+function StylusAnnotations:deselectContextSelection()
+    if not self.context_strokes then return false end
+    self:clearSelection()
+    self.context_strokes = nil
+    self:refreshToolPalette()
+    return true
+end
+
+function StylusAnnotations:isStrokeInSelection(stroke)
+    if not stroke or not self.context_strokes then return false end
+    for _, selected in ipairs(self.context_strokes) do
+        if selected == stroke then return true end
+    end
+    return false
+end
+
+function StylusAnnotations:onSelectionTouch(ges)
+    self.pending_selection_touch = nil
+    if self.selection_move or not self.context_strokes or not ges or not ges.pos then return false end
+    if self:isOverlayActive(ges.pos.x, ges.pos.y) then return false end
+    local stroke = self.store:findStrokeAt(ges.pos.x, ges.pos.y)
+    if self:isStrokeInSelection(stroke) then
+        self.pending_selection_touch = { x = ges.pos.x, y = ges.pos.y }
+    else
+        self:deselectContextSelection()
+    end
+    return false
+end
+
+function StylusAnnotations:startSelectionMove(x, y)
+    if self.selection_move or not self.context_strokes then return false end
+    local hit = self.store:findStrokeAt(x, y)
+    if not self:isStrokeInSelection(hit) then return false end
+    local strokes = self.context_strokes
+    local before = {}
+    for i, stroke in ipairs(strokes) do
+        before[i] = { stroke = stroke, points = util.tableDeepCopy(stroke.points) }
+    end
+    self:clearSelection()
+    self.selection_move = {
+        strokes = strokes,
+        before = before,
+        last_x = x,
+        last_y = y,
+        moved = false,
+        last_refresh = 0,
+    }
+    return true
+end
+
+function StylusAnnotations:moveSelectionTo(x, y)
+    local move = self.selection_move
+    if not move then return false end
+    local dx, dy = x - move.last_x, y - move.last_y
+    move.last_x, move.last_y = x, y
+    if dx == 0 and dy == 0 then return true end
+    local changed = false
+    for _, stroke in ipairs(move.strokes) do
+        if self.mapper:moveStrokeByScreen(stroke, dx, dy) then changed = true end
+    end
+    if changed then
+        move.moved = true
+        local now = time.now()
+        if move.last_refresh == 0
+            or time.to_ms(now - move.last_refresh) >= SELECTION_MOVE_REFRESH_INTERVAL_MS then
+            move.last_refresh = now
+            UIManager:setDirty(self.ui, "partial")
+        end
+    end
+    return true
+end
+
+function StylusAnnotations:finishSelectionMove(x, y)
+    local move = self.selection_move
+    if not move then return false end
+    if x and y then self:moveSelectionTo(x, y) end
+    self.selection_move = nil
+    self.pending_selection_touch = nil
+    if move.moved then
+        local after = {}
+        for i, stroke in ipairs(move.strokes) do
+            after[i] = { stroke = stroke, points = util.tableDeepCopy(stroke.points) }
+        end
+        self:recordHistory(function()
+            for _, entry in ipairs(move.before) do entry.stroke.points = entry.points end
+        end, function()
+            for _, entry in ipairs(after) do entry.stroke.points = entry.points end
+        end)
+        self:scheduleSave()
+    end
+    UIManager:setDirty(self.ui, "partial")
+    self:setSelection(move.strokes)
+    return true
+end
+
+function StylusAnnotations:onSelectionPan(ges)
+    if not self.selection_move then
+        local start = self.pending_selection_touch
+        if not start or not ges or not ges.pos then return false end
+        if self:isOverlayActive(start.x, start.y) then
+            self.pending_selection_touch = nil
+            return false
+        end
+        if not self:startSelectionMove(start.x, start.y) then
+            self.pending_selection_touch = nil
+            return false
+        end
+    end
+    if ges and ges.pos then self:moveSelectionTo(ges.pos.x, ges.pos.y) end
+    return true
+end
+
+function StylusAnnotations:onSelectionPanRelease(ges)
+    self.pending_selection_touch = nil
+    if not self.selection_move then return false end
+    self:finishSelectionMove(ges and ges.pos and ges.pos.x, ges and ges.pos and ges.pos.y)
+    return true
+end
+
 function StylusAnnotations:onStrokeTap(ges)
+    self.pending_selection_touch = nil
     return self:selectStrokeAt(ges)
 end
 
 function StylusAnnotations:onStrokeHold(ges)
-    return self:selectStrokeAt(ges, true)
+    local selected = self:selectStrokeAt(ges, true)
+    if selected and ges and ges.pos
+        and self:isStrokeInSelection(self:findStrokeAt(ges)) then
+        self.pending_selection_touch = { x = ges.pos.x, y = ges.pos.y }
+    end
+    return selected
 end
 
 function StylusAnnotations:findStrokeAt(ges)
@@ -337,6 +1046,7 @@ function StylusAnnotations:startStroke(x, y)
 
     self.hold_start_x, self.hold_start_y = x, y
     self:scheduleHoldTimer()
+    self:showToolPalette()
 end
 
 function StylusAnnotations:addStrokePoint(x, y)
@@ -427,7 +1137,7 @@ function StylusAnnotations:onStrokeCancel()
     self.dirty_region = nil
     self.stroke_timing = nil
     self:cancelLive()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:endStroke()
@@ -444,6 +1154,11 @@ function StylusAnnotations:endStroke()
     stroke.points = self.store:decimatePoints(stroke)
 
     self.store:add(stroke)
+    self:recordHistory(function()
+        self.store:remove({ stroke })
+    end, function()
+        self.store:add(stroke)
+    end)
 
     self:scheduleSave()
 
@@ -554,17 +1269,26 @@ function StylusAnnotations:refreshRegion(region)
     if region then
         local rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
         if rx then
-            UIManager:setDirty(self.view, function()
+            UIManager:setDirty(self.ui, function()
                 return "partial", Geom:new{x = rx, y = ry, w = rw, h = rh}
             end)
             return
         end
     end
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:paintTo(bb, x, y)
     self.mapper:paintTo(bb, x, y)
+    local points = self.lasso_points
+    if points and #points > 1 then
+        local path = {}
+        for i, point in ipairs(points) do
+            path[i] = { x = x + point.x, y = y + point.y }
+        end
+        path[#path + 1] = { x = x + points[1].x, y = y + points[1].y }
+        Draw.paintDashedPath(bb, path, 2, Blitbuffer.COLOR_BLACK, Blitbuffer.COLOR_WHITE, 7, 4)
+    end
 end
 
 function StylusAnnotations:getStrokeScreenWidth(stroke)
@@ -652,54 +1376,8 @@ end
 
 function StylusAnnotations:showStrokeMenu(strokes)
     self:setSelection(strokes)
-    local dialog
-    dialog = ButtonDialog:new{
-        width_factor = 0.45,
-        anchor = function()
-            local x0, y0, x1, y1 = self.store:getSelectionUnionBox(strokes)
-            if not x0 then return end
-            return Geometry.paddedRect(x0, y0, x1, y1, Geometry.strokePad(strokes[1].width, strokes[1].zoom))
-        end,
-        tap_close_callback = function()
-            self:clearSelection()
-        end,
-        buttons = {
-            {
-                {
-                    text = "\u{F48E}",
-                    callback = function()
-                        local count = #strokes
-                        self:closeStrokeDialog(dialog, function()
-                            self:deleteStrokes(strokes, count > 1)
-                        end)
-                    end,
-                },
-                {
-                    text = _("Color"),
-                    callback = function()
-                        self:closeStrokeDialog(dialog, function()
-                            self:chooseStrokeColor(strokes)
-                        end)
-                    end,
-                },
-                {
-                    text = _("Width"),
-                    callback = function()
-                        self:closeStrokeDialog(dialog, function()
-                            self:chooseStrokeWidth(strokes)
-                        end)
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(dialog, "[ui]")
-end
-
-function StylusAnnotations:closeStrokeDialog(dialog, action)
-    self:clearSelection()
-    UIManager:close(dialog)
-    action()
+    self.context_strokes = strokes
+    self:refreshToolPalette()
 end
 
 function StylusAnnotations:showStrokeMenuAt(x, y)
@@ -741,9 +1419,25 @@ function StylusAnnotations:choosePenColor()
 end
 
 function StylusAnnotations:setStrokeAttribute(strokes, attribute, value)
+    local changes = {}
+    for _, stroke in ipairs(strokes) do
+        if stroke[attribute] ~= value then
+            changes[#changes + 1] = { stroke = stroke, before = stroke[attribute] }
+        end
+    end
+    if #changes == 0 then return end
     self.store:setAttribute(strokes, attribute, value)
+    self:recordHistory(function()
+        for _, change in ipairs(changes) do
+            change.stroke[attribute] = change.before
+        end
+    end, function()
+        for _, change in ipairs(changes) do
+            change.stroke[attribute] = value
+        end
+    end)
     self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:setStrokeColor(strokes, color)
@@ -885,6 +1579,12 @@ function StylusAnnotations:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Show stylus toolbar"),
+                callback = function()
+                    self:showToolPalette()
+                end,
+            },
+            {
                 text_func = function()
                     return T(_("Width: %1"), self.width)
                 end,
@@ -927,21 +1627,170 @@ function StylusAnnotations:onStylusAnnotationsToggle()
 end
 
 function StylusAnnotations:deleteStrokes(strokes, notify)
-    local removed = self.store:remove(strokes)
+    local removed = self:removeStrokesWithUndo(strokes)
     self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
     if notify ~= false then
         self:notifyStrokeDeleted(removed)
     end
 end
 
-function StylusAnnotations:eraseStrokeAt(x, y)
-    local removed = self.store:eraseAt(x, y)
-    if removed > 0 then
-        self:scheduleSave()
-        UIManager:setDirty(self.view, "partial")
+function StylusAnnotations:beginEraser()
+    if self.erase_transaction then return end
+    if self.context_strokes then
+        self:deselectContextSelection()
     end
-    return removed
+    local base_index = {}
+    for i, stroke in ipairs(self.store.strokes) do
+        base_index[stroke] = i
+    end
+    self.erase_transaction = {
+        base_index = base_index,
+        changes = {},
+        changes_by_root = {},
+    }
+end
+
+function StylusAnnotations:mergeEraseChanges(changes)
+    local transaction = self.erase_transaction
+    if not transaction then return end
+    for _, change in ipairs(changes) do
+        local record = transaction.changes_by_root[change.root]
+        if not record then
+            record = {
+                index = transaction.base_index[change.root] or change.index,
+                before = change.before,
+                after = change.after,
+            }
+            transaction.changes_by_root[change.root] = record
+            transaction.changes[#transaction.changes + 1] = record
+        else
+            for _, source in ipairs(change.sources) do
+                for i, current in ipairs(record.after) do
+                    if current == source then
+                        table.remove(record.after, i)
+                        for j = #change.after, 1, -1 do
+                            table.insert(record.after, i, change.after[j])
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+end
+
+function StylusAnnotations:eraserCursorRect(cursor)
+    if not cursor then return end
+    local pad = cursor.radius + 4
+    return { x = cursor.x - pad, y = cursor.y - pad, w = 2 * pad, h = 2 * pad }
+end
+
+function StylusAnnotations:updateEraserCursor(x, y)
+    self.eraser_cursor = { x = x, y = y, radius = ERASER_RADIUS_PX }
+    local widget = self.eraser_cursor_widget
+    local created = false
+    if not widget then
+        widget = EraserCursor:new{
+            dimen = Geom:new{ w = Screen:getWidth(), h = Screen:getHeight() },
+        }
+        self.eraser_cursor_widget = widget
+        created = true
+    end
+    widget.cursor = self.eraser_cursor
+    if created then UIManager:show(widget, "[ui]") end
+
+    local now = time.now()
+    if self.eraser_last_refresh_time ~= 0
+        and time.to_ms(now - self.eraser_last_refresh_time) < self:liveRefreshInterval() then
+        return
+    end
+    self.eraser_last_refresh_time = now
+    local old_rect = self:eraserCursorRect(self.eraser_rendered_cursor)
+    local new_rect = self:eraserCursorRect(self.eraser_cursor)
+    local region
+    if old_rect then
+        region = Geometry.mergeRect(nil, old_rect.x, old_rect.y, old_rect.w, old_rect.h)
+    end
+    if new_rect then
+        region = Geometry.mergeRect(region, new_rect.x, new_rect.y, new_rect.w, new_rect.h)
+    end
+    self.eraser_rendered_cursor = {
+        x = x, y = y, radius = ERASER_RADIUS_PX,
+    }
+    if region then
+        local rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
+        if rx then UIManager:setDirty("all", "ui", Geom:new{ x = rx, y = ry, w = rw, h = rh }) end
+    end
+end
+
+function StylusAnnotations:hideEraserCursor()
+    local old_rect = self:eraserCursorRect(self.eraser_rendered_cursor)
+    local widget = self.eraser_cursor_widget
+    self.eraser_cursor = nil
+    self.eraser_rendered_cursor = nil
+    self.eraser_cursor_widget = nil
+    self.eraser_last_refresh_time = 0
+    if widget then
+        if old_rect then
+            local rx, ry, rw, rh = clampToScreen(old_rect.x, old_rect.y, old_rect.w, old_rect.h)
+            if rx then
+                UIManager:close(widget, "ui", Geom:new{ x = rx, y = ry, w = rw, h = rh })
+            else
+                UIManager:close(widget, "ui")
+            end
+        else
+            UIManager:close(widget, "ui")
+        end
+    end
+end
+
+function StylusAnnotations:endEraser()
+    local transaction = self.erase_transaction
+    self.erase_transaction = nil
+    if transaction and #transaction.changes > 0 then
+        table.sort(transaction.changes, function(a, b) return a.index < b.index end)
+        local history_changes = {}
+        for _, change in ipairs(transaction.changes) do
+            local after = {}
+            for _, stroke in ipairs(change.after) do
+                stroke._erase_root = nil
+                after[#after + 1] = {
+                    stroke = stroke,
+                    points = util.tableDeepCopy(stroke.points),
+                }
+            end
+            for _, entry in ipairs(change.before) do
+                entry.stroke._erase_root = nil
+            end
+            history_changes[#history_changes + 1] = {
+                index = change.index,
+                before = change.before,
+                after = after,
+            }
+        end
+        self:recordHistory(function()
+            self.store:applyChanges(history_changes, true)
+        end, function()
+            self.store:applyChanges(history_changes, false)
+        end)
+    end
+    self:hideEraserCursor()
+end
+
+function StylusAnnotations:eraseStrokeAt(x, y)
+    self:showToolPalette()
+    local owns_transaction = self.erase_transaction == nil
+    if owns_transaction then self:beginEraser() end
+    self:updateEraserCursor(x, y)
+    local changed, changes = self.store:erasePartialAt(x, y, ERASER_RADIUS_PX)
+    if changed > 0 then
+        self:mergeEraseChanges(changes)
+        self:scheduleSave()
+        UIManager:setDirty(self.ui, "partial")
+    end
+    if owns_transaction then self:endEraser() end
+    return changed
 end
 
 function StylusAnnotations:notifyStrokeDeleted(count)
@@ -971,7 +1820,7 @@ function StylusAnnotations:confirmDeleteStrokes(text, count, remove)
         ok_callback = function()
             local removed = remove()
             self:scheduleSave()
-            UIManager:setDirty(self.view, "partial")
+            UIManager:setDirty(self.ui, "partial")
             self:notifyStrokeDeleted(removed)
         end,
     })
@@ -981,22 +1830,30 @@ function StylusAnnotations:deleteAllStrokesOnPage()
     local pages = self:getVisiblePages()
     if not pages then return end
     local count = 0
+    local strokes = {}
     for _, page in ipairs(pages) do
-        count = count + #(self.store.strokes_by_page[page] or {})
+        for _, index in ipairs(self.store.strokes_by_page[page] or {}) do
+            count = count + 1
+            strokes[#strokes + 1] = self.store.strokes[index]
+        end
     end
     self:confirmDeleteStrokes(
         T(_("Delete all %1 strokes on this page?"), count), count,
         function()
-            return self.store:removeByPage(pages)
+            return self:removeStrokesWithUndo(strokes)
         end)
 end
 
 function StylusAnnotations:deleteAllStrokes()
     local total = #self.store.strokes
+    local strokes = {}
+    for i, stroke in ipairs(self.store.strokes) do
+        strokes[i] = stroke
+    end
     self:confirmDeleteStrokes(
         T(_("Delete all %1 strokes for this document?"), total), total,
         function()
-            return self.store:removeAll()
+            return self:removeStrokesWithUndo(strokes)
         end)
 end
 

@@ -20,6 +20,7 @@ function StrokeStore:new(mapper, logger)
         logger = logger or NOOP_LOGGER,
         strokes = {},
         strokes_by_page = {},
+        split_counter = os.time(),
     }
     return setmetatable(o, { __index = StrokeStore })
 end
@@ -110,10 +111,228 @@ function StrokeStore:findStrokeAt(x, y)
     return best
 end
 
+function StrokeStore:findStrokesInPolygon(polygon)
+    local selected = {}
+    if not polygon or #polygon < 3 then return selected end
+    local mapper = self.mapper
+    for _, stroke in ipairs(self.strokes) do
+        if not mapper:strokeCulled(stroke) then
+            local points = mapper:strokeToScreenPts(stroke)
+            if Geometry.polylineIntersectsPolygon(points, polygon) then
+                selected[#selected + 1] = stroke
+            end
+        end
+    end
+    return selected
+end
+
 function StrokeStore:eraseAt(x, y)
     local stroke = self:findStrokeAt(x, y)
     if not stroke then return 0 end
     return self:remove({ stroke })
+end
+
+local function cloneStroke(stroke, points, id)
+    local copy = {}
+    for key, value in pairs(stroke) do
+        if key ~= "points" then
+            if type(value) == "table" then
+                local nested = {}
+                for nested_key, nested_value in pairs(value) do
+                    nested[nested_key] = nested_value
+                end
+                copy[key] = nested
+            else
+                copy[key] = value
+            end
+        end
+    end
+    copy.points = points
+    if id then copy.id = id end
+    return copy
+end
+
+local function pointAt(points, index, t)
+    local ax, ay = points[index * 2 - 1], points[index * 2]
+    local bx, by = points[index * 2 + 1], points[index * 2 + 2]
+    return ax + (bx - ax) * t, ay + (by - ay) * t
+end
+
+local function appendPoint(points, x, y)
+    local count = #points
+    if count >= 2 then
+        local dx, dy = x - points[count - 1], y - points[count]
+        if dx * dx + dy * dy < 0.0001 then return end
+    end
+    points[#points + 1], points[#points + 2] = x, y
+end
+
+local function outsideCircleIntervals(ax, ay, bx, by, cx, cy, radius_sq)
+    local dx, dy = bx - ax, by - ay
+    local a = dx * dx + dy * dy
+    if a == 0 then
+        local ex, ey = ax - cx, ay - cy
+        if ex * ex + ey * ey < radius_sq then return {}, true end
+        return { { 0, 1 } }, false
+    end
+
+    local fx, fy = ax - cx, ay - cy
+    local closest_t = math.max(0, math.min(1, -(fx * dx + fy * dy) / a))
+    local qx, qy = fx + closest_t * dx, fy + closest_t * dy
+    if qx * qx + qy * qy >= radius_sq then return { { 0, 1 } }, false end
+
+    local bterm = 2 * (fx * dx + fy * dy)
+    local cterm = fx * fx + fy * fy - radius_sq
+    local discriminant = bterm * bterm - 4 * a * cterm
+    if discriminant <= 0 then return { { 0, 1 } }, false end
+    local root = math.sqrt(discriminant)
+    local enter = math.max(0, (-bterm - root) / (2 * a))
+    local leave = math.min(1, (-bterm + root) / (2 * a))
+    if leave <= enter then return { { 0, 1 } }, false end
+
+    local intervals = {}
+    if enter > 0.00001 then intervals[#intervals + 1] = { 0, enter } end
+    if leave < 0.99999 then intervals[#intervals + 1] = { leave, 1 } end
+    return intervals, true
+end
+
+local function eraserPieces(stroke, screen_points, x, y, radius)
+    local source = stroke.points
+    local count = math.floor(#screen_points / 2)
+    local pieces, current = {}, {}
+    local changed = false
+    local radius_sq = radius * radius
+
+    local function finishPiece()
+        if #current >= 2 then
+            pieces[#pieces + 1] = current
+        end
+        current = {}
+    end
+
+    if count == 1 then
+        local dx, dy = screen_points[1] - x, screen_points[2] - y
+        if dx * dx + dy * dy < radius_sq then return {}, true end
+        return { source }, false
+    end
+
+    for i = 1, count - 1 do
+        local ax, ay = screen_points[2 * i - 1], screen_points[2 * i]
+        local bx, by = screen_points[2 * i + 1], screen_points[2 * i + 2]
+        local intervals, hit = outsideCircleIntervals(ax, ay, bx, by, x, y, radius_sq)
+        if hit then changed = true end
+        if #intervals == 0 then
+            finishPiece()
+        else
+            for _, interval in ipairs(intervals) do
+                local t0, t1 = interval[1], interval[2]
+                if t0 > 0.00001 then finishPiece() end
+                appendPoint(current, pointAt(source, i, t0))
+                local ex, ey = pointAt(source, i, t1)
+                appendPoint(current, ex, ey)
+                if t1 < 0.99999 then finishPiece() end
+            end
+        end
+    end
+    finishPiece()
+    if not changed then return { source }, false end
+    return pieces, true
+end
+
+function StrokeStore:erasePartialAt(x, y, radius)
+    local changes = {}
+    local mapper = self.mapper
+    for index, stroke in ipairs(self.strokes) do
+        if not mapper:strokeCulled(stroke) then
+            local screen_points = mapper:strokeToScreenPts(stroke)
+            if screen_points and #screen_points > 0 then
+                local erase_radius = radius + mapper:getStrokeScreenWidth(stroke) / 2
+                local x0, y0, x1, y1 = Geometry.screenBounds(screen_points)
+                if x0 and x >= x0 - erase_radius and x <= x1 + erase_radius
+                    and y >= y0 - erase_radius and y <= y1 + erase_radius then
+                    local pieces, changed = eraserPieces(stroke, screen_points, x, y, erase_radius)
+                    if changed then
+                        local root = stroke._erase_root or stroke
+                        local before_points = {}
+                        for i, point in ipairs(stroke.points) do
+                            before_points[i] = point
+                        end
+                        local before = { stroke = stroke, points = before_points }
+                        local replacements = {}
+                        if #pieces > 0 then
+                            stroke.points = pieces[1]
+                            stroke._erase_root = root
+                            replacements[1] = stroke
+                            for i = 2, #pieces do
+                                self.split_counter = self.split_counter + 1
+                                local split = cloneStroke(stroke, pieces[i],
+                                    tostring(stroke.id) .. "_erase" .. tostring(self.split_counter))
+                                split._erase_root = root
+                                replacements[#replacements + 1] = split
+                            end
+                        end
+                        changes[#changes + 1] = {
+                            index = index,
+                            root = root,
+                            sources = { stroke },
+                            before = { before },
+                            after = replacements,
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    for i = #changes, 1, -1 do
+        local change = changes[i]
+        table.remove(self.strokes, change.index)
+        for j = #change.after, 1, -1 do
+            table.insert(self.strokes, change.index, change.after[j])
+        end
+    end
+    if #changes > 0 then self:rebuildPageIndex() end
+    return #changes, changes
+end
+
+function StrokeStore:applyChanges(changes, use_before)
+    local function applyChange(change, index)
+        local remove_count = use_before and #change.after or #change.before
+        for _ = 1, remove_count do
+            table.remove(self.strokes, index)
+        end
+        if use_before then
+            for j = #change.before, 1, -1 do
+                local entry = change.before[j]
+                entry.stroke.points = entry.points
+                table.insert(self.strokes, index, entry.stroke)
+            end
+        else
+            for j = #change.after, 1, -1 do
+                local entry = change.after[j]
+                entry.stroke.points = entry.points
+                table.insert(self.strokes, index, entry.stroke)
+            end
+        end
+    end
+
+    if use_before then
+        for i = #changes, 1, -1 do
+            local offset = 0
+            for j = 1, i - 1 do
+                offset = offset + #changes[j].after - #changes[j].before
+            end
+            applyChange(changes[i], changes[i].index + offset)
+        end
+    else
+        local offset = 0
+        for i = 1, #changes do
+            local change = changes[i]
+            applyChange(change, change.index + offset)
+            offset = offset + #change.after - #change.before
+        end
+    end
+    self:rebuildPageIndex()
 end
 
 function StrokeStore:strokesIntersectMid(a, b)

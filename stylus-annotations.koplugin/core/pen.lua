@@ -143,10 +143,31 @@ function PenInput:onStylusEvent(input, slot)
         return false
     end
 
-    if plugin:isOverlayActive() then
+    if plugin:isOverlayActive(x, y) then
+        if slot.tool == TOOL_TYPE_ERASER then
+            if self.eraser_active then
+                if not (slot.id and slot.id >= 0) then
+                    self.eraser_active = false
+                    plugin:endEraser()
+                end
+                return true
+            end
+            return false
+        end
         if self.pen_active then
             if not (slot.id and slot.id >= 0) then
                 self.pen_active = false
+                if plugin.current_stroke then
+                    plugin:endStroke()
+                end
+                if self.active_mode == "lasso" then
+                    plugin:finishLasso()
+                elseif self.active_mode == "move" then
+                    plugin:finishSelectionMove(x, y)
+                elseif self.active_mode == "eraser" then
+                    plugin:endEraser()
+                end
+                self.active_mode = nil
             end
             return true
         end
@@ -158,44 +179,84 @@ function PenInput:onStylusEvent(input, slot)
     end
 
     if slot.id and slot.id >= 0 then
-        if not plugin:isEnabled() then return false end
+        local mode = (self.pen_active and self.active_mode) or plugin.tool_mode or "pen"
+        if not self.pen_active and mode ~= "eraser" and plugin:startSelectionMove(x, y) then
+            self.pen_lift_pending = false
+            self.pen_active = true
+            self.active_mode = "move"
+            self.pen_lift_x, self.pen_lift_y = x, y
+            return true
+        end
+        if not self.pen_active and mode ~= "eraser" and plugin.context_strokes then
+            plugin:deselectContextSelection()
+        end
+        if mode == "pen" and not plugin:isEnabled() then return false end
+        if not self.pen_active then
+            self.pen_lift_x, self.pen_lift_y = x, y
+            if mode == "eraser" then
+                plugin:showToolPalette()
+                plugin:beginEraser()
+            end
+        end
         self.pen_lift_pending = false
         self.pen_active = true
 
-        if plugin.current_stroke then
-            plugin:addStrokePoint(x, y)
-        else
-            self.pen_lift_x = x
-            self.pen_lift_y = y
-            plugin:startStroke(x, y)
+        if mode == "move" then
+            plugin:moveSelectionTo(x, y)
+        elseif mode == "pen" then
+            if plugin.current_stroke then
+                plugin:addStrokePoint(x, y)
+            else
+                plugin:startStroke(x, y)
+            end
+        elseif mode == "eraser" then
+            plugin:eraseStrokeAt(x, y)
+        else -- lasso
+            if self.active_mode ~= "lasso" or not plugin.lasso_points then
+                plugin:startLasso(x, y)
+            else
+                plugin:addLassoPoint(x, y)
+            end
         end
+        self.active_mode = mode
         ret = true
     else
         local was_active = self.pen_active
+        local active_mode = self.active_mode
         self.pen_active = false
         if plugin.current_stroke then
             plugin:endStroke()
-            if was_active then
-                self.pen_lift_pending = true
-            end
         end
-
-        if plugin:isEnabled() and was_active then
-            ret = true
+        if active_mode == "lasso" then
+            plugin:finishLasso()
+        elseif active_mode == "move" then
+            plugin:finishSelectionMove(x, y)
+        elseif active_mode == "eraser" then
+            plugin:endEraser()
         end
+        if was_active then
+            self.pen_lift_pending = true
+            ret = active_mode ~= "pen" or plugin:isEnabled()
+        end
+        self.active_mode = nil
     end
     return ret
 end
 
 function PenInput:onEraserEvent(x, y, id)
     local plugin = self.plugin
-    if plugin:isOverlayActive() then return false end
+    if plugin:isOverlayActive(x, y) then return false end
     if id >= 0 then
+        if not self.eraser_active then
+            plugin:beginEraser()
+        end
         self.eraser_active = true
+        plugin:showToolPalette()
         plugin:eraseStrokeAt(x, y)
         return true
     else
         self.eraser_active = false
+        plugin:endEraser()
         return true
     end
 end

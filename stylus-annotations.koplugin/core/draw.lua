@@ -40,6 +40,53 @@ function Draw.stampPath(bb, pts, ox, oy, r, color)
     end
 end
 
+function Draw.paintDashedPath(bb, pts, width, color_a, color_b, dash_length, gap_length)
+    if #pts < 2 then return end
+    dash_length = dash_length or 7
+    gap_length = gap_length or 4
+    local pattern = dash_length + gap_length
+    local distance_along = 0
+    for i = 2, #pts do
+        local from, to = pts[i - 1], pts[i]
+        local dx, dy = to.x - from.x, to.y - from.y
+        local length = math.sqrt(dx * dx + dy * dy)
+        local segment_offset = 0
+        while segment_offset < length do
+            local pattern_offset = distance_along % pattern
+            local in_dash = pattern_offset < dash_length
+            local step = in_dash and (dash_length - pattern_offset) or (pattern - pattern_offset)
+            step = math.min(step, length - segment_offset)
+            if step < 0.001 then
+                step = math.min(0.001, length - segment_offset)
+            end
+            if in_dash and step > 0 then
+                local t0 = segment_offset / length
+                local t1 = (segment_offset + step) / length
+                Draw.stampPath(bb, {
+                    { x = from.x + dx * t0, y = from.y + dy * t0 },
+                    { x = from.x + dx * t1, y = from.y + dy * t1 },
+                }, 0, 0, width / 2,
+                    math.floor(distance_along / pattern) % 2 == 0 and color_a or color_b)
+            end
+            segment_offset = segment_offset + step
+            distance_along = distance_along + step
+        end
+    end
+end
+
+function Draw.paintCircleOutline(bb, cx, cy, radius, color, width)
+    local points = {}
+    local segments = 40
+    for i = 0, segments do
+        local angle = 2 * math.pi * i / segments
+        points[#points + 1] = {
+            x = cx + math.cos(angle) * radius,
+            y = cy + math.sin(angle) * radius,
+        }
+    end
+    Draw.stampPath(bb, points, 0, 0, (width or 2) / 2, color)
+end
+
 local EXTRA_COLORS = {
     {_("Black"), "black", "#000000"},
     {_("White"), "white", "#FFFFFF"},
@@ -109,19 +156,23 @@ function Draw.paintStrokePath(bb, sph, sw, color)
     box_h = math.min(bb:getHeight() - box_y, box_h)
     if box_w <= 0 or box_h <= 0 then return end
 
+    if bb:getInverse() == 1 then
+        -- An inverse buffer needs alpha-mask composition: filling the whole
+        -- stroke bounds produces visible rectangles in night mode.
+        local alpha = Blitbuffer.new(box_w, box_h, Blitbuffer.TYPE_BB8)
+        if not alpha then return end
+        alpha:paintRect(0, 0, box_w, box_h, Blitbuffer.COLOR_BLACK)
+        Draw.stampPath(alpha, sph, -box_x, -box_y, sw / 2, Blitbuffer.COLOR_WHITE)
+        bb:colorblitFromRGB32(alpha, box_x, box_y, 0, 0, box_w, box_h, color)
+        alpha:free()
+        return
+    end
+
     local mask = Blitbuffer.new(box_w, box_h, bb:getType())
     if not mask then return end
     mask:paintRect(0, 0, box_w, box_h, Blitbuffer.COLOR_WHITE)
-
     Draw.stampPath(mask, sph, -box_x, -box_y, sw / 2, color)
-
-    if bb:getInverse() == 1 then
-        local rb = color:getColorRGB32()
-        local inv = Blitbuffer.ColorRGB32(rb.r, rb.g, rb.b, 0xFF):invert()
-        bb:blendRectRGB32(box_x, box_y, box_w, box_h, inv)
-    else
-        bb:blitFrom(mask, box_x, box_y, 0, 0, box_w, box_h, bb.setPixelMultiply)
-    end
+    bb:blitFrom(mask, box_x, box_y, 0, 0, box_w, box_h, bb.setPixelMultiply)
     mask:free()
 end
 

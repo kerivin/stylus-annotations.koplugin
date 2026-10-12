@@ -85,6 +85,18 @@ function Paged:getZoom(page)
     return state and state.zoom or 1
 end
 
+function Paged:moveStrokeByScreen(stroke, dx, dy)
+    local zoom = self:getZoom(stroke.page)
+    if not zoom or zoom <= 0 then return false end
+    local points = stroke.points
+    local page_dx, page_dy = dx / zoom, dy / zoom
+    for i = 1, #points, 2 do
+        points[i] = points[i] + page_dx
+        points[i + 1] = points[i + 1] + page_dy
+    end
+    return true
+end
+
 function Paged:strokeCulled(stroke)
     local pages = self:getVisiblePages()
     if not pages then return true end
