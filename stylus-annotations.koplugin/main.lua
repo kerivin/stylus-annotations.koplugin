@@ -427,7 +427,7 @@ function StylusAnnotations:onStrokeCancel()
     self.dirty_region = nil
     self.stroke_timing = nil
     self:cancelLive()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:endStroke()
@@ -465,8 +465,12 @@ end
 function StylusAnnotations:finalizeLiveStroke(stroke, region)
     if not self.live_snapshot then return end
     local t0 = time.now()
-    region = region or self:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
-    if not region then return end
+    if not region then
+        -- getSelectionRect returns x, y, w, h (four values), not a rect table
+        local sx, sy, sw, sh = self:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
+        if not sx then return end
+        region = { x = sx, y = sy, w = sw, h = sh }
+    end
     local rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
     if not rx then return end
     Screen.bb:blitFrom(self.live_snapshot, rx, ry, rx, ry, rw, rh)
@@ -554,13 +558,13 @@ function StylusAnnotations:refreshRegion(region)
     if region then
         local rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
         if rx then
-            UIManager:setDirty(self.view, function()
+            UIManager:setDirty(self.ui, function()
                 return "partial", Geom:new{x = rx, y = ry, w = rw, h = rh}
             end)
             return
         end
     end
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:paintTo(bb, x, y)
@@ -743,7 +747,7 @@ end
 function StylusAnnotations:setStrokeAttribute(strokes, attribute, value)
     self.store:setAttribute(strokes, attribute, value)
     self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:setStrokeColor(strokes, color)
@@ -929,7 +933,7 @@ end
 function StylusAnnotations:deleteStrokes(strokes, notify)
     local removed = self.store:remove(strokes)
     self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
     if notify ~= false then
         self:notifyStrokeDeleted(removed)
     end
@@ -939,7 +943,7 @@ function StylusAnnotations:eraseStrokeAt(x, y)
     local removed = self.store:eraseAt(x, y)
     if removed > 0 then
         self:scheduleSave()
-        UIManager:setDirty(self.view, "partial")
+        UIManager:setDirty(self.ui, "partial")
     end
     return removed
 end
@@ -971,7 +975,7 @@ function StylusAnnotations:confirmDeleteStrokes(text, count, remove)
         ok_callback = function()
             local removed = remove()
             self:scheduleSave()
-            UIManager:setDirty(self.view, "partial")
+            UIManager:setDirty(self.ui, "partial")
             self:notifyStrokeDeleted(removed)
         end,
     })
