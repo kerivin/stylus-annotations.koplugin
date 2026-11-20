@@ -465,8 +465,12 @@ end
 function StylusAnnotations:finalizeLiveStroke(stroke, region)
     if not self.live_snapshot then return end
     local t0 = time.now()
-    region = region or self:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
-    if not region then return end
+    if not region then
+        -- getSelectionRect returns x, y, w, h (four values), not a rect table
+        local sx, sy, sw, sh = self:getSelectionRect(stroke, Screen:getWidth(), Screen:getHeight())
+        if not sx then return end
+        region = { x = sx, y = sy, w = sw, h = sh }
+    end
     local rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
     if not rx then return end
     Screen.bb:blitFrom(self.live_snapshot, rx, ry, rx, ry, rw, rh)
