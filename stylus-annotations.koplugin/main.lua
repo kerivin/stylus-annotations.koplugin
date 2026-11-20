@@ -427,7 +427,7 @@ function StylusAnnotations:onStrokeCancel()
     self.dirty_region = nil
     self.stroke_timing = nil
     self:cancelLive()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:endStroke()
@@ -558,13 +558,13 @@ function StylusAnnotations:refreshRegion(region)
     if region then
         local rx, ry, rw, rh = clampToScreen(region.x, region.y, region.w, region.h)
         if rx then
-            UIManager:setDirty(self.view, function()
+            UIManager:setDirty(self.ui, function()
                 return "partial", Geom:new{x = rx, y = ry, w = rw, h = rh}
             end)
             return
         end
     end
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:paintTo(bb, x, y)
@@ -747,7 +747,7 @@ end
 function StylusAnnotations:setStrokeAttribute(strokes, attribute, value)
     self.store:setAttribute(strokes, attribute, value)
     self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
 end
 
 function StylusAnnotations:setStrokeColor(strokes, color)
@@ -933,7 +933,7 @@ end
 function StylusAnnotations:deleteStrokes(strokes, notify)
     local removed = self.store:remove(strokes)
     self:scheduleSave()
-    UIManager:setDirty(self.view, "partial")
+    UIManager:setDirty(self.ui, "partial")
     if notify ~= false then
         self:notifyStrokeDeleted(removed)
     end
@@ -943,7 +943,7 @@ function StylusAnnotations:eraseStrokeAt(x, y)
     local removed = self.store:eraseAt(x, y)
     if removed > 0 then
         self:scheduleSave()
-        UIManager:setDirty(self.view, "partial")
+        UIManager:setDirty(self.ui, "partial")
     end
     return removed
 end
@@ -975,7 +975,7 @@ function StylusAnnotations:confirmDeleteStrokes(text, count, remove)
         ok_callback = function()
             local removed = remove()
             self:scheduleSave()
-            UIManager:setDirty(self.view, "partial")
+            UIManager:setDirty(self.ui, "partial")
             self:notifyStrokeDeleted(removed)
         end,
     })
